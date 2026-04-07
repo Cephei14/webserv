@@ -135,8 +135,12 @@ void HTTPRequest::Validate(const std::string& buf)
 	}
 	else if (_method == "POST" && _headers.find("transfer-encoding") == _headers.end())
 	    throw std::runtime_error("411 Length Required");
-	else
-	    _isParsed = true;
+	else if (_method == "POST" && _headers.find("transfer-encoding") != _headers.end())
+	{
+		if (_raw_buf.find("0\r\n\r\n") != std::string::npos)
+			_isParsed = true;
+	}
+	else _isParsed = true;
 }
 
 void HTTPRequest::AddRawP(const char* line, int nbytes)
@@ -157,7 +161,14 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req)
 	std::string full_path = root + req.getUri();
 	if (req.getUri() == "/")
 		full_path += "index.html";
-
+	if (req.getUri().find("..") != std::string::npos)
+	{
+		_statusCode = 403;
+		_body = "<h1>403 Forbidden: Invalid path</h1>";
+		_contentType = "text/html";
+		construct_response(req);
+		return;
+	}
 	body_GET(full_path);
 
 	if (_statusCode == 404)
@@ -202,6 +213,7 @@ HTTPResponse::HTTPResponse()
 	  _statusCode(200), 
 	  _reason(""), 
 	  _body(""), 
+	  _data_size(0),
 	  _contentType("text/plain"), 
 	  final_response("") 
 {}
@@ -309,7 +321,8 @@ void HTTPResponse::handle_chunks(const HTTPRequest& req)
         decoded_body.append(raw_body, pos, chunk_size);
         pos += chunk_size + 2; 
     }
-    _body = decoded_body; 
+	_data_size = decoded_body.size();
+    _post_body = decoded_body; 
 }
 
 
@@ -336,32 +349,69 @@ void HTTPResponse::prepare_POST(const HTTPRequest& req)
 {
 	std::string root = "./www";
 	std::string full_path = root + req.getUri();
-	if (req.getUri() == "/")
-		full_path += "index.html";
+	if (req.getUri().find("..") != std::string::npos)
+	{
+		_statusCode = 403;
+		_body = "<h1>403 Forbidden: Invalid path</h1>";
+		_contentType = "text/html";
+		construct_response(req);
+		return;
+	}
 	const std::map<std::string, std::string> &header_req = req.getMap();
 	std::map<std::string, std::string>::const_iterator it = header_req.find("content-length");
 	if (it != header_req.end()) 
 	{
 		_data_size = std::atoi(it->second.c_str());
-		std::string pure_body = req.getBody();
-		_body = pure_body.substr(0, _data_size);
+		_post_body = req.getBody().substr(0, _data_size);
 	}
 	else
-	{
-		_data_size = 0;
 		handle_chunks(req);
-	}
 	body_POST(full_path);
-	if (_statusCode == 204)
-	{
-		_body = "<html><body><h1>204 No Content</h1></body></html>";
-		_contentType = "text/html";
-	}
 	construct_response(req);
 }
 
 void HTTPResponse::prepare_DELETE(const HTTPRequest& req)
-{}
+{
+	std::string root = "./www";
+	std::string full_path = root + req.getUri();
+
+	if (req.getUri().find("..") != std::string::npos)
+	{
+		_statusCode = 403;
+		_body = "<h1>403 Forbidden: Invalid path</h1>";
+		_contentType = "text/html";
+		construct_response(req);
+		return;
+	}
+	if (req.getUri().find("/uploads/") == std::string::npos)
+    {
+        _statusCode = 403;
+        _body = "<h1>403 Forbidden: Deletion is restricted to the /uploads/ directory</h1>";
+        _contentType = "text/html";
+        construct_response(req);
+        return;
+    }
+
+	if (std::remove(full_path.c_str()) == 0)
+	{
+		_statusCode = 204;
+		_body = "";
+		_contentType = "";
+	}
+	else if (errno == EACCES || errno == EPERM)
+	{
+		_statusCode = 403;
+		_body = "<h1>403 Forbidden: Permission denied</h1>";
+		_contentType = "text/html";
+	}
+	else
+	{
+		_statusCode = 404;
+		_body = "<h1>404 Not Found: File does not exist</h1>";
+		_contentType = "text/html";
+	}
+	construct_response(req);
+}
 
 void HTTPResponse::prepare_else(const HTTPRequest& req)
 {
