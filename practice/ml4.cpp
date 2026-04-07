@@ -254,11 +254,6 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 	std::stringstream response_stream;
 	const std::map<std::string, std::string>& header_req = req.getMap();
 
-	if (header_req.find("host") == header_req.end())
-	{
-		_statusCode = 400;
-        _body = "<h1>400 Bad Request</h1>";
-	}
 	if (_reason.empty()) 
 	{
 		if (_statusCode == 200)
@@ -506,6 +501,11 @@ void server::srv_manage()
 						catch(const std::exception& e)
 						{
 							std::cerr << e.what() << std::endl;
+							// Send a quick error response before closing
+							HTTPResponse error_res;
+							error_res.prepare_else(current_req); // Defaults to 501, or create prepare_400
+							std::string raw = error_res.get_raw_response();
+							send(client_fd, raw.c_str(), raw.size(), 0);
 							close_connection(i);
 						}
 						if (current_req.IsParsed())
