@@ -210,11 +210,12 @@ const std::map<std::string, std::string>& HTTPRequest::getMap() const
 
 HTTPResponse::HTTPResponse() 
 	: _version("HTTP/1.1"), 
+	  _data_size(0),
 	  _statusCode(200), 
 	  _reason(""), 
 	  _body(""), 
-	  _data_size(0),
-	  _contentType("text/plain"), 
+	  _contentType("text/plain"),
+	  _post_body("") ,
 	  final_response("") 
 {}
 
@@ -225,7 +226,9 @@ std::string HTTPResponse::get_raw_response() const
 
 std::string HTTPResponse::get_content_type(const std::string& uri)
 {
-	size_t dot_pos = uri.find_last_of('.');
+	if (uri == "/" || uri.empty())
+        return "text/html";
+	size_t dot_pos = uri.find_last_of('.'); //to avoid downloading
 
 	if (dot_pos == std::string::npos)
         return "application/octet-stream";
@@ -617,9 +620,9 @@ void AppManager::run()
 	{
 		std::cout << "[Test Mode] Server is running on port " << PORT << std::endl;
 		std::cout << "[Test Mode] You can now connect via Browser or 'nc' in other terminals." << std::endl;
-		std::cout << "[Test Mode] Waiting 60 seconds before auto-shutdown..." << std::endl;
+		std::cout << "[Test Mode] Waiting 600 seconds before auto-shutdown..." << std::endl;
 		
-		sleep(60);
+		sleep(600);
 
 		std::cout << "[Test Mode] Shutting down server..." << std::endl;
 		kill(pid, SIGINT);

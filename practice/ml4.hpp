@@ -44,11 +44,11 @@ public:
 
 private:
 	std::string _version;
+	size_t _data_size;
 	int _statusCode;
 	std::string _reason;
 	std::string _body;
 	std::string _contentType;
-	size_t _data_size;
 	std::string _post_body;
 	std::string final_response;
 };
