@@ -161,6 +161,7 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req)
 	std::string full_path = root + req.getUri();
 	if (req.getUri() == "/")
 		full_path += "index.html";
+	_contentType = get_content_type(full_path);
 	if (req.getUri().find("..") != std::string::npos)
 	{
 		_statusCode = 403;
@@ -226,8 +227,6 @@ std::string HTTPResponse::get_raw_response() const
 
 std::string HTTPResponse::get_content_type(const std::string& uri)
 {
-	if (uri == "/" || uri.empty())
-        return "text/html";
 	size_t dot_pos = uri.find_last_of('.'); //to avoid downloading
 
 	if (dot_pos == std::string::npos)
@@ -276,7 +275,7 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 	response_stream << req.getVersion() << " " << _statusCode << " " << _reason << "\r\n";
 	
 	if (_contentType.empty() || _contentType == "text/plain")
-		_contentType = get_content_type(req.getUri());
+		_contentType = "text/html"; // Default for error pages or fallbacks
 
 	response_stream << "Content-Type: " << _contentType << "\r\n";
     response_stream << "Content-Length: " << _body.length() << "\r\n";
