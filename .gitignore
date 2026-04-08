@@ -1,12 +1,9 @@
+.vscode/
+.DS_Store
 *.o
 *.a
 *.so
 a.out
 webserv
-.DS_Store
-.vscode/
 .idea/
-practice/beej/client
-practice/beej/server
-practice/beej/poll
 *.dSYM/
