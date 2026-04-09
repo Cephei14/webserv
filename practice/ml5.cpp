@@ -629,9 +629,76 @@ void AppManager::run()
 	}
 }
 
-int main(void)
+std::vector<std::string> tokenize(std::string& config_data)
 {
-	AppManager start;
-	start.run();
+	std::vector<std::string> tokens;
+	std::string symbols = "{};";
+
+	for (size_t i = 0; i < config_data.length(); ++i)
+	{
+		if (symbols.find(config_data[i]) != std::string::npos)
+		{
+			config_data.insert(i, " ");
+			config_data.insert(i + 2, " ");
+			i += 2;
+		}
+	}
+	std::stringstream ss(config_data);
+	std::string temp;
+	while (ss >> temp)
+		tokens.push_back(temp);
+	return tokens;
+}
+
+void ConfigManager(char **argv)
+{
+    std::string filepath = argv[1];
+    std::ifstream cnf(filepath.c_str());
+    
+    if (cnf.is_open())
+    {
+        std::ostringstream ss;
+        ss << cnf.rdbuf();
+        std::string config_data = ss.str();
+        cnf.close();
+
+        size_t h = config_data.find("#");
+        while (h != std::string::npos)
+        {
+            size_t n = config_data.find("\n", h);
+            
+            if (n == std::string::npos) 
+			{
+                config_data.erase(h); 
+                break;
+			}
+            else 
+                config_data.erase(h, n - h); 
+            h = config_data.find("#", h);
+        }
+		std::vector<std::string> tokens = tokenize(config_data);
+    }
+    else
+        throw std::runtime_error("Configuration file Error");
+}
+
+int main(int argc, char **argv)
+{
+	if(argc != 2)
+	{
+		std::cerr << "Configuration file Error" << std::endl;
+		return 1;
+	}
+	try
+	{
+		ConfigManager(argv);
+		AppManager start;
+		start.run();
+	}
+	catch(const std::exception& e)
+	{
+		std::cerr << e.what() << std::endl;
+		return 1;
+	}
     return 0;
 }

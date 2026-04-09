@@ -111,3 +111,35 @@ public:
 	static void signal_handler(int s);
 	void run();
 };
+
+
+class LocationConfig
+{
+public:
+	LocationConfig() : _autoindex(false) {}
+	std::string _root;
+	std::string _index;
+	std::string _cgi_ext;
+	std::string _path;
+	std::string _cgi_path;
+	std::vector<std::string> _allowed_methods;
+	bool _autoindex;
+};
+
+class ServerConfig
+{
+public:
+	ServerConfig() : _port(8080), _client_max_body_size(1048576) {}
+	int _port;
+	size_t _client_max_body_size;
+	std::string _host;
+	std::vector<std::string> _server_names;
+	std::map<int, std::string> _error_pages;
+	std::vector<LocationConfig> _locations;
+};
+
+class Config
+{
+public:
+	std::vector<ServerConfig> _servers;
+};
