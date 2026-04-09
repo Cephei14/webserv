@@ -227,7 +227,7 @@ std::string HTTPResponse::get_raw_response() const
 
 std::string HTTPResponse::get_content_type(const std::string& uri)
 {
-	size_t dot_pos = uri.find_last_of('.'); //to avoid downloading
+	size_t dot_pos = uri.find_last_of('.');
 
 	if (dot_pos == std::string::npos)
         return "application/octet-stream";
@@ -650,6 +650,152 @@ std::vector<std::string> tokenize(std::string& config_data)
 	return tokens;
 }
 
+ServerConfig::ServerConfig() : _port(8080), _client_max_body_size(1048576)
+{}
+
+LocationConfig::LocationConfig() : _autoindex(false), _return_code(0)
+{}
+
+size_t parse_size(std::string s)
+{
+	if (s.empty())
+		return 0;
+	char unit = toupper(s[s.length() - 1]);
+	size_t multiplier = 1;
+
+	if (unit == 'K')
+		multiplier = 1024;
+	else if (unit == 'M')
+		multiplier = 1024 * 1024;
+	else if (unit == 'G')
+		multiplier = 1024 * 1024 * 1024;
+	if (unit == 'K' || unit == 'M' || unit == 'G')
+		s.erase(s.length() - 1);
+	return (static_cast<size_t>(std::atoll(s.c_str()) * multiplier));
+}
+
+Config parse_config(std::vector<std::string> tokens)
+{
+	Config final_config;
+
+	for (size_t i = 0; i < tokens.size(); ++i)
+	{
+		if (tokens[i] == "server")
+		{
+			i++;
+			if (i < tokens.size() && tokens[i] == "{")
+				i++;
+			ServerConfig serv;
+			while (i < tokens.size() && tokens[i] != "}")
+			{
+				if (tokens[i] == "listen")
+				{
+					if (++i < tokens.size())
+						serv._port = std::atoi(tokens[i].c_str());
+				}
+				else if (tokens[i] == "host")
+				{
+					if (++i < tokens.size())
+						serv._host = tokens[i];
+				}
+				else if (tokens[i] == "server_name")
+				{
+					while (++i < tokens.size() && tokens[i] != ";")
+						serv._server_names.push_back(tokens[i]);
+				}
+				else if (tokens[i] == "client_max_body_size")
+				{
+					if (++i < tokens.size())
+						serv._client_max_body_size = parse_size(tokens[i]); 
+				}
+				else if (tokens[i] == "error_page")
+				{
+					std::vector<std::string> tmp;
+					while (++i < tokens.size() && tokens[i] != ";")
+						tmp.push_back(tokens[i]);
+					if (tmp.size() >= 2) 
+					{
+						std::string path = tmp.back();
+						for (size_t j = 0; j < tmp.size() - 1; ++j)
+							serv._error_pages[std::atoi(tmp[j].c_str())] = path;
+					}
+				}
+				else if (tokens[i] == "root")
+				{
+					if (++i < tokens.size())
+						serv._root = tokens[i];
+				}
+				else if (tokens[i] == "index")
+				{
+					while (++i < tokens.size() && tokens[i] != ";")
+						serv._index.push_back(tokens[i]);
+				}
+				else if (tokens[i] == "location")
+				{
+					LocationConfig loc;
+					loc._path = tokens[++i];
+					i++;
+					if (tokens[i] == "{")
+						i++;
+					while (i < tokens.size() && tokens[i] != "}")
+					{
+						if (tokens[i] == "root")
+						{
+							if (++i < tokens.size()) loc._root = tokens[i];
+						}
+						else if (tokens[i] == "allow_methods")
+						{
+							while (++i < tokens.size() && tokens[i] != ";")
+								loc._allowed_methods.push_back(tokens[i]);
+						}
+						else if (tokens[i] == "index")
+						{
+							while (++i < tokens.size() && tokens[i] != ";")
+								loc._index.push_back(tokens[i]);
+						}
+						else if (tokens[i] == "cgi_path")
+							if (++i < tokens.size()) loc._cgi_path = tokens[i];
+						else if (tokens[i] == "cgi_extension")
+						{
+							while (++i < tokens.size() && tokens[i] != ";")
+								loc._cgi_ext.push_back(tokens[i]);
+						}
+						else if (tokens[i] == "autoindex")
+						{
+							if(i < tokens.size())
+							{
+								if(++i < tokens.size() && tokens[i] == "on")
+									loc._autoindex = true;
+								else
+									loc._autoindex = false;
+							}
+						}
+						else if (tokens[i] == "return")
+						{
+							if (++i < tokens.size())
+								loc._return_code = std::atoi(tokens[i].c_str());
+							if (++i < tokens.size())
+								loc._return_url = tokens[i];
+						}
+					}
+					serv._locations.push_back(loc);
+				}
+			}
+			for (size_t j = 0; j < serv._locations.size(); ++j)
+			{
+				if (serv._locations[j]._root.empty())
+					serv._locations[j]._root = serv._root;
+				if (serv._locations[j]._index.empty())
+					serv._locations[j]._index = serv._index;
+			}
+			if (serv._host.empty())
+				serv._host = "127.0.0.1";
+			final_config._servers.push_back(serv);
+		}
+	}
+	return final_config;
+}
+
 void ConfigManager(char **argv)
 {
     std::string filepath = argv[1];
@@ -677,6 +823,7 @@ void ConfigManager(char **argv)
             h = config_data.find("#", h);
         }
 		std::vector<std::string> tokens = tokenize(config_data);
+		Config final_config = parse_config(tokens);
     }
     else
         throw std::runtime_error("Configuration file Error");

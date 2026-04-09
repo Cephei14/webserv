@@ -116,22 +116,26 @@ public:
 class LocationConfig
 {
 public:
-	LocationConfig() : _autoindex(false) {}
+	LocationConfig();
 	std::string _root;
-	std::string _index;
-	std::string _cgi_ext;
+	std::vector<std::string> _index;
+	std::vector<std::string> _cgi_ext;
 	std::string _path;
 	std::string _cgi_path;
 	std::vector<std::string> _allowed_methods;
 	bool _autoindex;
+	int _return_code;
+	std::string _return_url;
 };
 
 class ServerConfig
 {
 public:
-	ServerConfig() : _port(8080), _client_max_body_size(1048576) {}
+	ServerConfig();
 	int _port;
 	size_t _client_max_body_size;
+	std::string _root;
+	std::vector<std::string> _index;
 	std::string _host;
 	std::vector<std::string> _server_names;
 	std::map<int, std::string> _error_pages;
