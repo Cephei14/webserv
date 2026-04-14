@@ -8,8 +8,8 @@
       "args": [],
       "stopAtEntry": false,
       "externalConsole": false,
-      "cwd": "/home/cepheus/projects/webserv",
-      "program": "/home/cepheus/projects/webserv/build/Debug/outDebug",
+      "cwd": "/home/cepheus/projects/webserv/practice",
+      "program": "/home/cepheus/projects/webserv/practice/build/Debug/outDebug",
       "MIMode": "gdb",
       "miDebuggerPath": "gdb",
       "setupCommands": [

@@ -1,4 +1,5 @@
 #include "ml5.hpp"
+static volatile sig_atomic_t signaled = 0;
 
 HTTPRequest::HTTPRequest() : _isParsed(false), _headersParsed(false)
 {}
@@ -12,53 +13,73 @@ void *get_addr_type(struct sockaddr *the_addr)
 	return &((reinterpret_cast<struct sockaddr_in6*>(the_addr))->sin6_addr);
 }
 
-void server::start_listening()
+void server::start_listening(Config& servers)
 {
-	struct addrinfo hints, *res, *p;
-	int ra;
-	int yes = 1;
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-	if ((ra = getaddrinfo(NULL, PORT, &hints, &res)) != 0)
+	bool has_listener = false;
+	for (size_t idx = 0; idx < servers._servers.size(); ++idx)
 	{
-		std::cerr << "srv[ERROR]: getaddrinfo " << gai_strerror(ra) <<std::endl;
-		return;
-	}
-	for(p = res; p != NULL; p = p->ai_next)
-	{
-		if((sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
+		ServerConfig& srv = servers._servers[idx];
+		struct addrinfo hints, *res, *p;
+		int ra;
+		int yes = 1;
+		std::stringstream ss;
+		ss << srv._port;
+		std::string port = ss.str();
+		memset(&hints, 0, sizeof hints);
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_flags = AI_PASSIVE;
+		if ((ra = getaddrinfo(srv._host.c_str(), port.c_str(), &hints, &res)) != 0)
 		{
-			std::cerr << "srv [socket] " << std::endl;
+			std::cerr << "srv[ERROR]: getaddrinfo " << gai_strerror(ra) <<std::endl;
 			continue;
 		}
-		if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes ,sizeof(int)) == -1)
+		for(p = res; p != NULL; p = p->ai_next)
 		{
-			std::cerr << "srv [setsockopt]" << std::endl;
-			exit(1);
+			_port_socket[srv._port] = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+			if(_port_socket[srv._port]== -1)
+			{
+				std::cerr << "srv [socket] " << std::endl;
+				continue;
+			}
+			if (setsockopt(_port_socket[srv._port], SOL_SOCKET, SO_REUSEADDR, &yes ,sizeof(int)) == -1)
+			{
+				std::cerr << "srv [setsockopt]" << std::endl;
+				close(_port_socket[srv._port]);
+				continue;
+			}
+			if (bind(_port_socket[srv._port], p->ai_addr, p->ai_addrlen) == -1)
+			{
+				close(_port_socket[srv._port]);
+				std::cerr << "srv [Bind]" << std::endl;
+				continue;
+			}
+			break;
 		}
-		if (bind(sock, p->ai_addr, p->ai_addrlen) == -1)
+		freeaddrinfo(res);
+
+		if (p == NULL)
 		{
-			close(sock);
-			std::cerr << "srv [Bind]" << std::endl;
+			std::cerr << "server failed to bind" << std::endl;
 			continue;
 		}
-		break;
+		if (listen(_port_socket[srv._port], 10) == -1)
+		{
+			std::cerr << "Listen" << std::endl;
+			close(_port_socket[srv._port]);
+			continue;
+		}
+		if (fcntl(_port_socket[srv._port], F_SETFL, O_NONBLOCK) == -1)
+		{
+			close(_port_socket[srv._port]);
+			continue;
+		}
+		poll_setup(_port_socket[srv._port]);
+		_listener_to_server[_port_socket[srv._port]] = static_cast<int>(idx);
+		has_listener = true;
 	}
-	freeaddrinfo(res);
-
-	if (p == NULL)
-	{
-		std::cerr << "server failed to bind" << std::endl;
-		exit (1);
-	}
-	if (listen(sock, 10) == -1)
-	{
-		std::cerr << "Listen" << std::endl;
-		exit(1);
-	}
-
+	if (!has_listener)
+		throw std::runtime_error("No valid listening sockets");
 }
 
 void server::poll_setup(int newfd)
@@ -78,27 +99,27 @@ void HTTPRequest::Validate(const std::string& buf)
 	{
 		size_t n = buf.find("\r\n");
 		if(n == std::string::npos)
-			throw std::out_of_range("Invalid Method");
+			throw std::out_of_range("400 Bad Request");
 		std::string requestLine = buf.substr(0, n);
 		size_t pos = requestLine.find(' ');
 		if(pos == std::string::npos)
-			throw std::out_of_range("Invalid Method");
+			throw std::out_of_range("400 Bad Request");
 		_method = requestLine.substr(0, pos);
 		if (_method != "POST" && _method != "GET" && _method != "DELETE")
-			throw std::runtime_error("Invalid Method");
+			throw std::runtime_error("501 Not Implemented");
 		size_t m = requestLine.find(' ', pos + 1);
 		if(m == std::string::npos)
-			throw std::out_of_range("Invalid Method");
+			throw std::runtime_error("400 Bad Request");
 		_uri = requestLine.substr(pos + 1, m - pos - 1);
-		if (_uri[0] != '/')
-			throw std::runtime_error("Invalid Method");
+		if (!_uri.empty() && _uri[0] != '/')
+			throw std::runtime_error("400 Bad Request");
 		_version = requestLine.substr(m + 1, n - m - 1);
 		if (_version != "HTTP/1.1")
-			throw std::runtime_error("Invalid Method");
+			throw std::runtime_error("505 HTTP Version Not Supported");
 
 		std::string allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";	
 		if (end_of_headers == std::string::npos)
-			throw std::runtime_error("400 Bad Request");
+			return;
 		std::string Header = buf.substr(n + 2, end_of_headers - (n + 2) + 2); 
 		while (Header != "\r\n" && !Header.empty()) 
 		{
@@ -155,12 +176,12 @@ bool HTTPRequest::IsParsed()
 	return(_isParsed);
 }
 
-void HTTPResponse::prepare_GET(const HTTPRequest& req)
+void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv)
 {
-	std::string root = "./www";
+	std::string& root = srv._root;
 	std::string full_path = root + req.getUri();
-	if (req.getUri() == "/")
-		full_path += "index.html";
+	if (req.getUri() == "/" && !srv._index.empty())
+		full_path += srv._index[0];
 	_contentType = get_content_type(full_path);
 	if (req.getUri().find("..") != std::string::npos)
 	{
@@ -258,12 +279,26 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 	{
 		if (_statusCode == 200)
 			_reason = "OK";
+		else if (_statusCode == 201)
+			_reason = "Created";
+		else if (_statusCode == 204)
+			_reason = "No Content";
 		else if (_statusCode == 404)
 			_reason = "Not Found";
 		else if (_statusCode == 400)
 			_reason = "Bad Request";
+		else if (_statusCode == 403)
+			_reason = "Forbidden";
+		else if (_statusCode == 405)
+			_reason = "Method Not Allowed";
+		else if (_statusCode == 411)
+			_reason = "Length Required";
+		else if (_statusCode == 413)
+			_reason = "Payload Too Large";
 		else if (_statusCode == 501)
 			_reason = "Not Implemented";
+		else if (_statusCode == 505)
+			_reason = "HTTP Version Not Supported";
 		else
 			_reason = "Error";
 	}
@@ -280,7 +315,7 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 	if (it != header_req.end() && it->second == "close")
 	    response_stream << "Connection: close\r\n";
 	else
-	    response_stream << "Connection: keep-alive\r\n";
+		response_stream << "Connection: keep-alive\r\n";
 	response_stream << "\r\n";
 	response_stream << _body;
 	final_response = response_stream.str();
@@ -288,6 +323,13 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 
 void HTTPResponse::body_GET(const std::string& path)
 {
+	struct stat st;
+	if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+	{
+		_statusCode = 404;
+		return;
+	}
+
 	std::ifstream file(path.c_str(), std::ios::binary);
 	if (file.is_open())
 	{
@@ -342,9 +384,9 @@ void HTTPResponse::body_POST(const std::string& path)
 	}	
 }
 
-void HTTPResponse::prepare_POST(const HTTPRequest& req)
+void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv)
 {
-	std::string root = "./www";
+	std::string& root = srv._root;
 	std::string full_path = root + req.getUri();
 	if (req.getUri().find("..") != std::string::npos)
 	{
@@ -367,9 +409,9 @@ void HTTPResponse::prepare_POST(const HTTPRequest& req)
 	construct_response(req);
 }
 
-void HTTPResponse::prepare_DELETE(const HTTPRequest& req)
+void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv)
 {
-	std::string root = "./www";
+	std::string& root = srv._root;
 	std::string full_path = root + req.getUri();
 
 	if (req.getUri().find("..") != std::string::npos)
@@ -410,50 +452,183 @@ void HTTPResponse::prepare_DELETE(const HTTPRequest& req)
 	construct_response(req);
 }
 
-void HTTPResponse::prepare_else(const HTTPRequest& req)
+void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 {
-	_statusCode = 501;
-	_body = "<h1>501 Not Implemented</h1>";
-	_contentType = "text/html";
-	construct_response(req);
-}
+	LocationConfig* best_loc = NULL;
+	size_t best_len = 0;
 
-void HTTPResponse::build(const HTTPRequest& req)
-{
+	for(size_t j = 0; j < srv._locations.size(); j++)
+	{
+		LocationConfig& loc = srv._locations[j];
+		if (loc._path.empty())
+			continue;
+		if (req.getUri().compare(0, loc._path.size(), loc._path) != 0)
+			continue;
+		if (req.getUri().size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && req.getUri()[loc._path.size()] != '/')
+			continue;
+		if (loc._path.size() >= best_len)
+		{
+			best_len = loc._path.size();
+			best_loc = &loc;
+		}
+	}
+
+	if (best_loc == NULL)
+	{
+		for (size_t j = 0; j < srv._locations.size(); ++j)
+		{
+			if (srv._locations[j]._path == "/")
+			{
+				best_loc = &srv._locations[j];
+				break;
+			}
+		}
+	}
+
+	if (best_loc == NULL)
+	{
+		_statusCode = 404;
+		build_error_response(_statusCode, srv);
+		return;
+	}
+
+	bool method_found = false;
+	for(size_t k = 0; k < best_loc->_allowed_methods.size(); k++)
+	{
+		if (req.getMethod() == best_loc->_allowed_methods[k])
+		{
+			method_found = true;
+			break;
+		}
+	}
+	if(!method_found)
+	{
+		_statusCode = 405;
+		build_error_response(_statusCode, srv);
+		return;
+	}
+
 	if(req.getMethod() == "GET")
-		prepare_GET(req);
+		prepare_GET(req, srv);
 	else if(req.getMethod() == "POST")
-		prepare_POST(req);
+	{
+		if(req.getBody().size() <= srv._client_max_body_size)
+			prepare_POST(req, srv);
+		else
+		{
+			_statusCode = 413;
+			build_error_response(_statusCode, srv);
+		}
+	}
 	else if(req.getMethod() == "DELETE")
-		prepare_DELETE(req);
+		prepare_DELETE(req, srv);
 	else
-		prepare_else(req);
+	{
+		_statusCode = 405;
+		build_error_response(_statusCode, srv);
+	}
 }
 
 void server::close_connection(size_t& i)
 {
+	if (i >= _fds.size())
+		return;
+
 	int fd = _fds[i].fd;
+	if (_listener_to_server.find(fd) != _listener_to_server.end())
+		return;
+
 	close(fd);
 	_requests.erase(fd);
+	_client_to_server.erase(fd);
 	_responses.erase(fd);
 	_fds.erase(_fds.begin() + i);
+	_pending_response.erase(fd);
 	i--;
 }
 
-void server::srv_manage()
+void HTTPResponse::build_error_response(int status_code, ServerConfig& srv)
 {
-	fcntl(sock, F_SETFL, O_NONBLOCK);
-	poll_setup(sock);
-	while(1)
+	std::stringstream response;
+    std::string reason_phrase;
+    std::string body_str;
+    bool custom_page_loaded = false;
+
+	switch(status_code)
 	{
+		case 400: reason_phrase = "Bad Request"; break;
+        case 403: reason_phrase = "Forbidden"; break;
+        case 404: reason_phrase = "Not Found"; break;
+        case 405: reason_phrase = "Method Not Allowed"; break;
+        case 411: reason_phrase = "Length Required"; break;
+        case 413: reason_phrase = "Payload Too Large"; break;
+        case 500: reason_phrase = "Internal Server Error"; break;
+        case 501: reason_phrase = "Not Implemented"; break;
+        case 505: reason_phrase = "HTTP Version Not Supported"; break;
+		default: reason_phrase = "Error"; break;
+	}
+	std::map<int, std::string>::iterator it = srv._error_pages.find(status_code);
+	std::string filepath;
+	if (it != srv._error_pages.end())
+	{
+		bool r_slash = (!srv._root.empty() && srv._root[srv._root.size() - 1] == '/');
+		bool p_slash = (!it->second.empty() && it->second[0] == '/');
+		if (r_slash && p_slash)
+			filepath = srv._root + it->second.substr(1);
+		else if (!r_slash && !p_slash)
+			filepath = srv._root + "/" +it->second.substr(1);
+		else	
+			filepath = srv._root + it->second.substr(1);
+        
+        std::ifstream file(filepath.c_str());
+        if (file.is_open()) 
+        {
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            body_str = buffer.str();
+            custom_page_loaded = true;
+            file.close();
+        }
+    }
+	if (!custom_page_loaded)
+	{
+		std::stringstream ss;
+		ss << "<html>\r\n";
+        ss << "<head><title>" << status_code << " " << reason_phrase << "</title></head>\r\n";
+        ss << "<body>\r\n";
+        ss << "<center><h1>" << status_code << " " << reason_phrase << "</h1></center>\r\n";
+        ss << "<hr><center>webserv/1.0</center>\r\n";
+        ss << "</body>\r\n";
+        ss << "</html>\r\n";
+        
+        body_str = ss.str();
+	}
+	response << "HTTP/1.1 " << status_code << " " << reason_phrase << "\r\n";
+    response << "Content-Type: text/html\r\n";
+    response << "Content-Length: " << body_str.length() << "\r\n";
+    response << "Connection: close\r\n";
+    response << "\r\n";
+    response << body_str;
+    this->final_response = response.str();
+}
+
+void server::srv_manage(Config& servers)
+{
+	while(!signaled)
+	{
+		if (_fds.empty())
+			continue;
+
 		if (poll(&_fds[0], _fds.size(), TOUT) == -1)
 		{
 			if (errno == EINTR)
 				continue;
 			std::cerr << "Poll" << std::endl;
-			exit(1);
+			continue;
 		}
-		for(size_t i = 0; i < _fds.size(); i++)
+
+		size_t i = 0;
+		for(i = 0; i < _fds.size(); i++)
 		{
 			if (_fds[i].revents & POLLIN)
 			{
@@ -461,26 +636,33 @@ void server::srv_manage()
 				socklen_t len = sizeof the_addr;
 				char s[INET6_ADDRSTRLEN];
 				int client_fd = _fds[i].fd;
+				std::map<int, int>::iterator listener_it = _listener_to_server.find(client_fd);
+				bool is_listener = (listener_it != _listener_to_server.end());
 
-				if(client_fd == sock) //new connection
+				if (is_listener)
 				{
-					int cnxfd = accept(sock, reinterpret_cast<sockaddr*>(&the_addr), &len);
+					int cnxfd = accept(client_fd, reinterpret_cast<sockaddr*>(&the_addr), &len);
 					if (cnxfd == -1)
 					{
 						std::cerr << "Failed to connect " << std::endl;
 						continue;
 					}
-					fcntl(cnxfd, F_SETFL, O_NONBLOCK);
+					if (fcntl(cnxfd, F_SETFL, O_NONBLOCK) == -1)
+					{
+						close(cnxfd);
+						continue;
+					}
 					poll_setup(cnxfd);
 					_requests[cnxfd] = HTTPRequest();
+					_client_to_server[cnxfd] = listener_it->second;
 					inet_ntop(the_addr.ss_family, get_addr_type(reinterpret_cast<sockaddr*>(&the_addr)), s, sizeof s);
 					std::cout << "srv: new connection from " << s << " on fd " << cnxfd << " (Total clients: " << _fds.size() - 1 << ")" << std::endl;
 				}
-				else  //existing connection
+				if (!is_listener)
 				{
 					char buf[BUFF_SIZE];
 					int nbytes = recv(client_fd, buf, BUFF_SIZE - 1, 0);
-					
+
 					if (nbytes <= 0)
 					{
 						if(nbytes == 0)
@@ -495,138 +677,115 @@ void server::srv_manage()
 					{
 						HTTPRequest& current_req = _requests[client_fd];
 						try
-						{ 
+						{
 							current_req.AddRawP(buf, nbytes);
 						}
 						catch(const std::exception& e)
 						{
-							std::cerr << e.what() << std::endl;
-							// Send a quick error response before closing
-							HTTPResponse error_res;
-							error_res.prepare_else(current_req); // Defaults to 501, or create prepare_400
-							std::string raw = error_res.get_raw_response();
-							send(client_fd, raw.c_str(), raw.size(), 0);
-							close_connection(i);
+						    int status_code = std::atoi(e.what()); 
+						
+						    if (status_code < 400 || status_code > 599)
+						        status_code = 500;
+						    std::cerr << "Request Failed: " << e.what() << std::endl;
+						
+						    HTTPResponse error_res;
+							int s_idx = 0;
+							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
+							if (s_it != _client_to_server.end())
+								s_idx = s_it->second;
+							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
+								s_idx = 0;
+						    error_res.build_error_response(status_code, servers._servers[s_idx]);
+						    std::string raw = error_res.get_raw_response();
+							_pending_response[client_fd] = raw;
+							_fds[i].events = POLLIN | POLLOUT;
 						}
 						if (current_req.IsParsed())
 						{
+							int s_idx = 0;
+							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
+							if (s_it != _client_to_server.end())
+								s_idx = s_it->second;
+							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
+								s_idx = 0;
 							HTTPResponse new_response;
-							new_response.build(current_req);
+							new_response.build(current_req, servers._servers[s_idx]);
 							std::string raw = new_response.get_raw_response();
-                            send(client_fd, raw.c_str(), raw.size(), 0);
-							close_connection(i);
-							std::cout << "srv: response sent and connection closed." << std::endl;
+							_pending_response[client_fd] = raw;
+							_fds[i].events = POLLIN | POLLOUT;
 						}
-						
 					}
+				}
+			}
+			else if(_fds[i].revents & POLLOUT)
+			{
+				int client_fd = _fds[i].fd;
+				std::map<int, std::string>::iterator p_it = _pending_response.find(client_fd);
+				if (p_it == _pending_response.end())
+				{
+					_fds[i].events = POLLIN;
+					continue;
+				}
+				if (p_it->second.empty())
+				{
+					close_connection(i);
+					continue;
+				}
+				int bytes_sent = send(client_fd, p_it->second.c_str(), p_it->second.size(), 0);
+				if (bytes_sent > 0)
+					p_it->second.erase(0, static_cast<size_t>(bytes_sent));
+				else if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+					continue;
+				else
+				{
+					close_connection(i);
+					continue;
+				}
+				if (p_it->second.empty())
+				{
+					close_connection(i);
+					std::cout << "srv: response sent and connection closed." << std::endl;
 				}
 			}
 		}
 	}
-}
-
-void client::start_cnx()
-{
-	struct addrinfo *p, hints, *res;
-	int ra, sz;
-	char buf[BUFF_SIZE];
-	char s[INET6_ADDRSTRLEN];
-
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
-	if ((ra = getaddrinfo(IP , PORT , &hints, &res)) != 0)
+	for(size_t i = 0; i < _fds.size(); i++)
 	{
-		std::cerr << "cli[ERROR]: getaddrinfo " << gai_strerror(ra) <<std::endl;
-		return;
+		int fd = _fds[i].fd;
+		if (fd >= 0)
+			close(fd);
 	}
-	for (p = res; p != NULL; p = p->ai_next)
-	{
-		if ((sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
-		{
-			std::cerr << "cli [socket] " << std::endl;
-			continue;
-		}
-		if (connect(sock, p->ai_addr, p->ai_addrlen) == -1)
-		{
-			std::cerr << "cli [connect] " << std::endl;
-			close(sock);
-			continue;
-		}
-		break;
-	}
-
-	if (p == NULL)
-	{
-		std::cerr << "Failed to connect to a server " << std::endl;
-		freeaddrinfo(res);
-		return; 
-	}
-
-	inet_ntop(p->ai_family, get_addr_type(p->ai_addr), s, sizeof s);
-	std::cout << "Connected to " << s << std::endl;
-	freeaddrinfo(res);
-
-	if ((sz = send(sock, "Hello from client", 17, 0)) == -1)
-		std::cerr << "cli [send] " << std::endl;
-
-	if ((sz = recv(sock, buf, BUFF_SIZE - 1, 0)) > 0)
-	{
-		buf[sz] = '\0';
-		std::cout << "cli [MSG] : " << buf << std::endl;
-	}
-	else if (sz == -1)
-		std::cerr << "cli [recv] " << std::endl;
-
-	close(sock);
+	_fds.clear();
+	_requests.clear();
+	_responses.clear();
+	_client_to_server.clear();
+	_listener_to_server.clear();
+	_port_socket.clear();
+	_pending_response.clear();
+	return;
 }
 
 void AppManager::signal_handler(int s)
 {
 	(void)s;
+	signaled = 1;
 	int saved_errno = errno;
-	while(waitpid(-1, NULL, WNOHANG) > 0);
 	errno = saved_errno;
 }
 
-void AppManager::run()
+void AppManager::run(Config& servers)
 {
 	struct sigaction sa;
-
-	sa.sa_handler = AppManager::signal_handler;
+	sa.sa_handler = signal_handler;
 	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = SA_RESTART;
-	if(sigaction(SIGCHLD, &sa, NULL) == -1)
-	{
-		std::cerr << "Sigaction" <<std::endl;
-		exit (1);
-	}
-
-	pid_t pid = fork();
-
-	if(pid == -1)
-	{
-		std::cerr << "Fork" << std::endl;
-		exit (1);
-	}
-	else if (pid == 0)
-	{
-		server serv;
-		serv.start_listening();
-		serv.srv_manage();
-	}
-	else
-	{
-		std::cout << "[Test Mode] Server is running on port " << PORT << std::endl;
-		std::cout << "[Test Mode] You can now connect via Browser or 'nc' in other terminals." << std::endl;
-		std::cout << "[Test Mode] Waiting 600 seconds before auto-shutdown..." << std::endl;
-		
-		sleep(600);
-
-		std::cout << "[Test Mode] Shutting down server..." << std::endl;
-		kill(pid, SIGINT);
-		waitpid(pid, NULL, 0);
-	}
+	sa.sa_flags=0;
+	if (sigaction(SIGTERM, &sa, NULL) == -1)
+		throw std::runtime_error("SIGACTION FAILED");
+	if (sigaction(SIGINT, &sa, NULL) == -1)
+		throw std::runtime_error("SIGACTION FAILED");
+	server serv;
+	serv.start_listening(servers);
+	serv.srv_manage(servers);
 }
 
 std::vector<std::string> tokenize(std::string& config_data)
@@ -674,10 +833,8 @@ size_t parse_size(std::string s)
 	return (static_cast<size_t>(std::atoll(s.c_str()) * multiplier));
 }
 
-Config parse_config(std::vector<std::string> tokens)
+void parse_config(std::vector<std::string> tokens, Config& final_config)
 {
-	Config final_config;
-
 	for (size_t i = 0; i < tokens.size(); ++i)
 	{
 		if (tokens[i] == "server")
@@ -733,15 +890,16 @@ Config parse_config(std::vector<std::string> tokens)
 				else if (tokens[i] == "location")
 				{
 					LocationConfig loc;
-					loc._path = tokens[++i];
-					i++;
-					if (tokens[i] == "{")
+					if (++i < tokens.size())
+						loc._path = tokens[i];
+					if (++i < tokens.size() && tokens[i] == "{")
 						i++;
 					while (i < tokens.size() && tokens[i] != "}")
 					{
 						if (tokens[i] == "root")
 						{
-							if (++i < tokens.size()) loc._root = tokens[i];
+							if (++i < tokens.size())
+								loc._root = tokens[i];
 						}
 						else if (tokens[i] == "allow_methods")
 						{
@@ -754,7 +912,10 @@ Config parse_config(std::vector<std::string> tokens)
 								loc._index.push_back(tokens[i]);
 						}
 						else if (tokens[i] == "cgi_path")
-							if (++i < tokens.size()) loc._cgi_path = tokens[i];
+						{
+							if (++i < tokens.size())
+								loc._cgi_path = tokens[i];
+						}
 						else if (tokens[i] == "cgi_extension")
 						{
 							while (++i < tokens.size() && tokens[i] != ";")
@@ -777,9 +938,30 @@ Config parse_config(std::vector<std::string> tokens)
 							if (++i < tokens.size())
 								loc._return_url = tokens[i];
 						}
+						else
+							throw std::runtime_error("Unknown directive in location: " + tokens[i]);
+
+						if (i < tokens.size() && tokens[i] == ";")
+							i++;
+						else if (i + 1 < tokens.size() && tokens[i + 1] == ";")
+							i += 2;
+						else
+							i++;
 					}
 					serv._locations.push_back(loc);
+					if (i < tokens.size() && tokens[i] == "}")
+						i++;
+					continue;
 				}
+				else
+					throw std::runtime_error("Unknown directive in config: " + tokens[i]);
+
+				if (i < tokens.size() && tokens[i] == ";")
+					i++;
+				else if (i + 1 < tokens.size() && tokens[i + 1] == ";")
+					i += 2;
+				else
+					i++;
 			}
 			for (size_t j = 0; j < serv._locations.size(); ++j)
 			{
@@ -788,15 +970,25 @@ Config parse_config(std::vector<std::string> tokens)
 				if (serv._locations[j]._index.empty())
 					serv._locations[j]._index = serv._index;
 			}
+			if (serv._index.empty())
+			{
+				for (size_t j = 0; j < serv._locations.size(); ++j)
+				{
+					if (serv._locations[j]._path == "/" && !serv._locations[j]._index.empty())
+					{
+						serv._index = serv._locations[j]._index;
+						break;
+					}
+				}
+			}
 			if (serv._host.empty())
 				serv._host = "127.0.0.1";
 			final_config._servers.push_back(serv);
 		}
 	}
-	return final_config;
 }
 
-void ConfigManager(char **argv)
+void ConfigManager(char **argv, Config& servers)
 {
     std::string filepath = argv[1];
     std::ifstream cnf(filepath.c_str());
@@ -823,7 +1015,7 @@ void ConfigManager(char **argv)
             h = config_data.find("#", h);
         }
 		std::vector<std::string> tokens = tokenize(config_data);
-		Config final_config = parse_config(tokens);
+		parse_config(tokens, servers);
     }
     else
         throw std::runtime_error("Configuration file Error");
@@ -838,9 +1030,10 @@ int main(int argc, char **argv)
 	}
 	try
 	{
-		ConfigManager(argv);
+		Config servers;
+		ConfigManager(argv, servers);
 		AppManager start;
-		start.run();
+		start.run(servers);
 	}
 	catch(const std::exception& e)
 	{
