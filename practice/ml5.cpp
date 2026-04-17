@@ -1,8 +1,27 @@
 #include "ml5.hpp"
 static volatile sig_atomic_t signaled = 0;
 
-HTTPRequest::HTTPRequest() : _isParsed(false), _headersParsed(false)
+HTTPRequest::HTTPRequest() : _isParsed(false), _headersParsed(false), _parsed_request_end(0)
 {}
+
+void HTTPRequest::reset_parse_state() 
+{
+	_method.clear();
+	_uri.clear();
+	_version.clear();
+	_headers.clear();
+	_headersParsed = false;
+	_isParsed = false;
+	 _parsed_request_end = 0;
+}
+
+void HTTPRequest::consume_parsed_request()
+{
+	_raw_buf.erase(0, _parsed_request_end);
+	reset_parse_state();
+	if(!_raw_buf.empty())
+		Validate(_raw_buf);
+}
 
 void *get_addr_type(struct sockaddr *the_addr)
 {
@@ -99,11 +118,11 @@ void HTTPRequest::Validate(const std::string& buf)
 	{
 		size_t n = buf.find("\r\n");
 		if(n == std::string::npos)
-			throw std::out_of_range("400 Bad Request");
+			return;
 		std::string requestLine = buf.substr(0, n);
 		size_t pos = requestLine.find(' ');
 		if(pos == std::string::npos)
-			throw std::out_of_range("400 Bad Request");
+			throw std::runtime_error("400 Bad Request");
 		_method = requestLine.substr(0, pos);
 		if (_method != "POST" && _method != "GET" && _method != "DELETE")
 			throw std::runtime_error("501 Not Implemented");
@@ -147,27 +166,37 @@ void HTTPRequest::Validate(const std::string& buf)
 			throw std::runtime_error("400 Bad Request");
 		_headersParsed = true;
 	}
+	size_t body_start = end_of_headers + 4;
 	if (_headers.find("content-length") != _headers.end())
 	{
 	    long content_length = std::atol(_headers["content-length"].c_str());
-	    size_t body_received = _raw_buf.size() - (end_of_headers + 4);
-	    if (body_received >= static_cast<size_t>(content_length))
-	        _isParsed = true;
+		size_t required_end = body_start + content_length;
+		if(_raw_buf.size() < required_end)
+			return;
+		_parsed_request_end = required_end;
+	    _isParsed = true;
 	}
 	else if (_method == "POST" && _headers.find("transfer-encoding") == _headers.end())
 	    throw std::runtime_error("411 Length Required");
 	else if (_method == "POST" && _headers.find("transfer-encoding") != _headers.end())
 	{
-		if (_raw_buf.find("0\r\n\r\n") != std::string::npos)
-			_isParsed = true;
+		size_t chunk_end = _raw_buf.find("0\r\n\r\n", body_start);
+		if (chunk_end == std::string::npos)
+			return;
+		_parsed_request_end = chunk_end + 5;
+		_isParsed = true;
 	}
-	else _isParsed = true;
+	else
+	{
+		_parsed_request_end = body_start;
+		_isParsed = true;
+	}
 }
 
 void HTTPRequest::AddRawP(const char* line, int nbytes)
 {
 	_raw_buf.append(line, nbytes);
-	if ((_raw_buf.find("\r\n\r\n") != std::string::npos) && !_isParsed)
+	if (!_isParsed)
 		Validate(_raw_buf);
 }
 
@@ -204,9 +233,10 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv)
 std::string HTTPRequest::getBody() const
 {
 	size_t n = _raw_buf.find("\r\n\r\n");
-	if (n == std::string::npos)
+	size_t body_start = n + 4;
+	if (n == std::string::npos || _parsed_request_end <= body_start)
 		return ("");
-	return _raw_buf.substr(n + 4);
+	return _raw_buf.substr(body_start, _parsed_request_end - body_start);
 }
 
 const std::string& HTTPRequest::getUri() const
@@ -244,6 +274,21 @@ HTTPResponse::HTTPResponse()
 std::string HTTPResponse::get_raw_response() const
 {
 	return final_response;
+}
+
+
+std::pair<std::string, std::string> HTTPResponse::split_uri_path_query(const std::string& uri)
+{
+	std::pair<std::string, std::string> path_query;
+	size_t q = uri.find('?');
+	if(q == std::string::npos)
+		return (std::make_pair(uri, ""));
+	else
+	{
+		std::string path = uri.substr(0,q);
+		std::string query = uri.substr(q + 1);
+		return (std::make_pair(path, query));
+	}
 }
 
 std::string HTTPResponse::get_content_type(const std::string& uri)
@@ -384,6 +429,10 @@ void HTTPResponse::body_POST(const std::string& path)
 	}	
 }
 
+void HTTPResponse::prepare_CGI(const HTTPRequest& req, ServerConfig& srv)
+{
+
+}
 void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv)
 {
 	std::string& root = srv._root;
@@ -456,15 +505,17 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 {
 	LocationConfig* best_loc = NULL;
 	size_t best_len = 0;
-
+	std::pair<std::string, std::string> result = split_uri_path_query(req.getUri());
+	std::string path = result.first;
+	std::string query = result.second;
 	for(size_t j = 0; j < srv._locations.size(); j++)
 	{
 		LocationConfig& loc = srv._locations[j];
 		if (loc._path.empty())
 			continue;
-		if (req.getUri().compare(0, loc._path.size(), loc._path) != 0)
+		if (path.compare(0, loc._path.size(), loc._path) != 0)
 			continue;
-		if (req.getUri().size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && req.getUri()[loc._path.size()] != '/')
+		if (path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && path[loc._path.size()] != '/')
 			continue;
 		if (loc._path.size() >= best_len)
 		{
@@ -507,10 +558,32 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 		build_error_response(_statusCode, srv);
 		return;
 	}
-
-	if(req.getMethod() == "GET")
+	bool is_cgi =false;
+	if(!best_loc->_cgi_ext.empty() && !best_loc->_cgi_path.empty()) //i have to use the path here too
+	{
+		std::string p = NULL;
+		size_t q = req.getUri().find('?');
+		if (q == std::string::npos)
+			p = req.getUri();
+		else 
+			p = req.getUri().substr(0, q);
+		size_t dot = p.find_last_of('.');
+		if(dot != std::string::npos)
+		{
+			std::string ext = p.substr(dot);
+			for(size_t k = 0; k < best_loc->_cgi_ext.size(); k++)
+			{
+				if (best_loc->_cgi_ext[k] == ext)
+				{
+					is_cgi = true;
+					break;
+				}
+			}
+		}
+	}
+	if(req.getMethod() == "GET" && !is_cgi)
 		prepare_GET(req, srv);
-	else if(req.getMethod() == "POST")
+	else if(req.getMethod() == "POST" && !is_cgi)
 	{
 		if(req.getBody().size() <= srv._client_max_body_size)
 			prepare_POST(req, srv);
@@ -520,6 +593,8 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 			build_error_response(_statusCode, srv);
 		}
 	}
+	else if(is_cgi && (req.getMethod() == "GET" || req.getMethod() == "POST"))
+		prepare_CGI(req, srv);
 	else if(req.getMethod() == "DELETE")
 		prepare_DELETE(req, srv);
 	else
@@ -544,6 +619,7 @@ void server::close_connection(size_t& i)
 	_responses.erase(fd);
 	_fds.erase(_fds.begin() + i);
 	_pending_response.erase(fd);
+	_fd_keep_alive.erase(fd);
 	i--;
 }
 
@@ -698,9 +774,10 @@ void server::srv_manage(Config& servers)
 						    error_res.build_error_response(status_code, servers._servers[s_idx]);
 						    std::string raw = error_res.get_raw_response();
 							_pending_response[client_fd] = raw;
+							_fd_keep_alive[client_fd] = false;
 							_fds[i].events = POLLIN | POLLOUT;
 						}
-						if (current_req.IsParsed())
+						if (current_req.IsParsed() && _pending_response.find(client_fd) == _pending_response.end())
 						{
 							int s_idx = 0;
 							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
@@ -712,6 +789,18 @@ void server::srv_manage(Config& servers)
 							new_response.build(current_req, servers._servers[s_idx]);
 							std::string raw = new_response.get_raw_response();
 							_pending_response[client_fd] = raw;
+							bool keep_alive = true;
+							const std::map<std::string, std::string>& headers = current_req.getMap();
+							std::map<std::string, std::string>::const_iterator conn_it = headers.find("connection");
+							if (conn_it != headers.end())
+							{
+								std::string conn_value = conn_it->second;
+								for (size_t k = 0; k < conn_value.size(); ++k)
+									conn_value[k] = static_cast<char>(tolower(conn_value[k]));
+								if (conn_value == "close")
+									keep_alive = false;
+							}
+							_fd_keep_alive[client_fd] = keep_alive;
 							_fds[i].events = POLLIN | POLLOUT;
 						}
 					}
@@ -721,6 +810,8 @@ void server::srv_manage(Config& servers)
 			{
 				int client_fd = _fds[i].fd;
 				std::map<int, std::string>::iterator p_it = _pending_response.find(client_fd);
+				std::map<int, bool>::iterator k_it = _fd_keep_alive.find(client_fd);
+				bool keep_alive = (k_it != _fd_keep_alive.end() && k_it->second);
 				if (p_it == _pending_response.end())
 				{
 					_fds[i].events = POLLIN;
@@ -728,7 +819,43 @@ void server::srv_manage(Config& servers)
 				}
 				if (p_it->second.empty())
 				{
-					close_connection(i);
+					if (keep_alive)
+					{
+						_pending_response.erase(client_fd);
+						_fd_keep_alive.erase(client_fd);
+						_requests[client_fd].consume_parsed_request();
+						if(_requests[client_fd].IsParsed() == true)
+						{
+							int s_idx = 0;
+							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
+							if (s_it != _client_to_server.end())
+								s_idx = s_it->second;
+							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
+								s_idx = 0;
+							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
+							std::string raw = _responses[client_fd].get_raw_response();
+							_pending_response[client_fd] = raw;
+							const std::map<std::string, std::string>& headers = _requests[client_fd].getMap();
+							std::map<std::string, std::string>::const_iterator conn_it = headers.find("connection");
+							if (conn_it != headers.end())
+							{
+								std::string conn_value = conn_it->second;
+								for (size_t k = 0; k < conn_value.size(); ++k)
+									conn_value[k] = static_cast<char>(tolower(conn_value[k]));
+								if (conn_value == "close")
+									keep_alive = false;
+							}
+							_fd_keep_alive[client_fd] = keep_alive;
+							_fds[i].events = POLLIN | POLLOUT;
+						}
+						else
+							_fds[i].events = POLLIN;
+					}
+					else
+					{
+						close_connection(i);
+						std::cout << "srv: response sent and connection closed." << std::endl;
+					}
 					continue;
 				}
 				int bytes_sent = send(client_fd, p_it->second.c_str(), p_it->second.size(), 0);
@@ -743,8 +870,43 @@ void server::srv_manage(Config& servers)
 				}
 				if (p_it->second.empty())
 				{
-					close_connection(i);
-					std::cout << "srv: response sent and connection closed." << std::endl;
+					if (keep_alive)
+					{
+						_pending_response.erase(client_fd);
+						_fd_keep_alive.erase(client_fd);
+						_requests[client_fd].consume_parsed_request();
+						if(_requests[client_fd].IsParsed() == true)
+						{
+							int s_idx = 0;
+							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
+							if (s_it != _client_to_server.end())
+								s_idx = s_it->second;
+							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
+								s_idx = 0;
+							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
+							std::string raw = _responses[client_fd].get_raw_response();
+							_pending_response[client_fd] = raw;
+							const std::map<std::string, std::string>& headers = _requests[client_fd].getMap();
+							std::map<std::string, std::string>::const_iterator conn_it = headers.find("connection");
+							if (conn_it != headers.end())
+							{
+								std::string conn_value = conn_it->second;
+								for (size_t k = 0; k < conn_value.size(); ++k)
+									conn_value[k] = static_cast<char>(tolower(conn_value[k]));
+								if (conn_value == "close")
+									keep_alive = false;
+							}
+							_fd_keep_alive[client_fd] = keep_alive;
+							_fds[i].events = POLLIN | POLLOUT;
+						}
+						else
+							_fds[i].events = POLLIN;
+					}
+					else
+					{
+						close_connection(i);
+						std::cout << "srv: response sent and connection closed." << std::endl;
+					}
 				}
 			}
 		}
@@ -762,6 +924,7 @@ void server::srv_manage(Config& servers)
 	_listener_to_server.clear();
 	_port_socket.clear();
 	_pending_response.clear();
+	_fd_keep_alive.clear();
 	return;
 }
 

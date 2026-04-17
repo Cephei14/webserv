@@ -69,13 +69,14 @@ public:
 	void prepare_GET(const HTTPRequest& req, ServerConfig& srv);
 	void prepare_POST(const HTTPRequest& req, ServerConfig& srv);
 	void prepare_DELETE(const HTTPRequest& req, ServerConfig& srv);
-	void prepare_else(const HTTPRequest& req);
+	void prepare_CGI(const HTTPRequest& req, ServerConfig& srv);
 	std::string get_content_type(const std::string& uri);
 	std::string get_raw_response() const;
 	void body_GET(const std::string& path);
 	void body_POST(const std::string& path);
 	void handle_chunks(const HTTPRequest& req);
 	void build_error_response(int status_code, ServerConfig& config);
+	std::pair<std::string, std::string> split_uri_path_query(const std::string& uri);
 
 private:
 	std::string _version;
@@ -95,6 +96,8 @@ public:
 	bool IsParsed();
 	void AddRawP(const char* line, int nbytes);
 	void Validate(const std::string& line);
+	void consume_parsed_request();
+	void reset_parse_state();
 	const std::string& getMethod() const;
 	const std::string& getUri() const;
 	const std::map<std::string, std::string>& getMap() const;
@@ -109,6 +112,7 @@ private:
 	std::map<std::string, std::string> _headers;
 	bool _isParsed;
 	bool _headersParsed;
+	size_t _parsed_request_end;
 };
 
 class server
@@ -126,6 +130,7 @@ private:
 	std::map<int, HTTPResponse> _responses;
 	std::map<int, std::string> _pending_response;
 	std::map<int, int> _client_to_server;
+	std::map<int, bool> _fd_keep_alive;
 };
 
 // getaddrinfo() ; freeaddrinfo() ; socket() ; bind() ; listen() ; accept() ; recv() ; close(); setsockopt
