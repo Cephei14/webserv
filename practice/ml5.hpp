@@ -19,6 +19,7 @@
 #include <stdexcept>	
 #include <fstream>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #define BUFF_SIZE 1024
 #define TOUT 1000
@@ -66,10 +67,9 @@ public:
 	HTTPResponse();
 	void construct_response(const HTTPRequest& req);
 	void build(const HTTPRequest& req, ServerConfig& srv);
-	void prepare_GET(const HTTPRequest& req, ServerConfig& srv);
-	void prepare_POST(const HTTPRequest& req, ServerConfig& srv);
-	void prepare_DELETE(const HTTPRequest& req, ServerConfig& srv);
-	void prepare_CGI(const HTTPRequest& req, ServerConfig& srv);
+	void prepare_GET(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc);
+	void prepare_POST(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc);
+	void prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc);
 	std::string get_content_type(const std::string& uri);
 	std::string get_raw_response() const;
 	void body_GET(const std::string& path);
@@ -86,7 +86,7 @@ private:
 	std::string _body;
 	std::string _contentType;
 	std::string _post_body;
-	std::string final_response;
+	std::string _final_response;
 };
 
 class HTTPRequest
@@ -123,6 +123,32 @@ public:
 	void poll_setup(int newfd);
 	void close_connection(size_t& index);
 private:
+	struct CgiJob
+	{
+		CgiJob()
+			: client_fd(-1), server_index(0), pid(-1), in_fd(-1), out_fd(-1), write_offset(0), start_ms(0), child_done(false), child_status(0)
+		{}
+		int client_fd;
+		int server_index;
+		pid_t pid;
+		int in_fd;
+		int out_fd;
+		std::string request_body;
+		size_t write_offset;
+		std::string output;
+		long start_ms;
+		bool child_done;
+		int child_status;
+	};
+
+	bool is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationConfig*& best_loc, std::string& uri_path);
+	bool start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc, const std::string& uri_path, int server_index);
+	void process_cgi_pipe_event(size_t& i, Config& servers);
+	void finalize_cgi_job(int client_fd, Config& servers, bool success, int status_code);
+	void cleanup_cgi_job(int client_fd, bool kill_child);
+	void set_client_events(int client_fd, short events);
+	bool get_keep_alive(const HTTPRequest& req) const;
+
 	std::map<int, int> _port_socket;
 	std::map<int, int> _listener_to_server;
 	std::vector<struct pollfd> _fds;
@@ -131,6 +157,9 @@ private:
 	std::map<int, std::string> _pending_response;
 	std::map<int, int> _client_to_server;
 	std::map<int, bool> _fd_keep_alive;
+	std::map<int, CgiJob> _cgi_jobs;
+	std::map<int, int> _cgi_in_to_client;
+	std::map<int, int> _cgi_out_to_client;
 };
 
 // getaddrinfo() ; freeaddrinfo() ; socket() ; bind() ; listen() ; accept() ; recv() ; close(); setsockopt
