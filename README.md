@@ -20,7 +20,7 @@ Build:
 make
 ```
 
-Run (recommended from `practice/` because config paths are relative):
+Run:
 
 ```bash
 cd practice
