@@ -1,4 +1,4 @@
-*This project has been created as part of the 42 curriculum by cepheus.*
+*This project has been created as part of the 42 curriculum by rdhaibi.*
 
 ## Description
 `webserv` is a small HTTP/1.1 server written in C++98.
