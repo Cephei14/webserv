@@ -49,6 +49,7 @@ curl --http1.1 -i 'http://127.0.0.1:8080/cgi-bin/test.py?x=42'
 - RFC 7230 (HTTP/1.1 Message Syntax and Routing)
 - RFC 7231 (HTTP/1.1 Semantics and Content)
 - NGINX documentation for behavior comparison
+- BEEJ's guide for socket coding
 - `man poll`, `man socket`, `man recv`, `man send`, `man execve`, `man waitpid`
 
 AI usage:
