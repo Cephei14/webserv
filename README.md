@@ -23,7 +23,6 @@ make
 Run:
 
 ```bash
-cd practice
 ../webserv webserv.conf
 ```
 

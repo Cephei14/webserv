@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <sys/time.h>
 
 #define BUFF_SIZE 1024
 #define TOUT 1000
@@ -148,6 +149,7 @@ private:
 	void cleanup_cgi_job(int client_fd, bool kill_child);
 	void set_client_events(int client_fd, short events);
 	bool get_keep_alive(const HTTPRequest& req) const;
+	int resolve_server_index(int client_fd, const HTTPRequest& req, const Config& servers) const;
 
 	std::map<int, int> _port_socket;
 	std::map<int, int> _listener_to_server;
@@ -161,8 +163,6 @@ private:
 	std::map<int, int> _cgi_in_to_client;
 	std::map<int, int> _cgi_out_to_client;
 };
-
-// getaddrinfo() ; freeaddrinfo() ; socket() ; bind() ; listen() ; accept() ; recv() ; close(); setsockopt
 
 class AppManager
 {

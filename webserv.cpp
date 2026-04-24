@@ -1,5 +1,4 @@
-#include "ml5.hpp"
-#include <sys/time.h>
+#include "webserv.hpp"
 static volatile sig_atomic_t signaled = 0;
 
 static long now_ms()
@@ -25,6 +24,48 @@ static std::string trim_copy(const std::string& s)
 		return "";
 	size_t end = s.find_last_not_of(" \t");
 	return s.substr(start, end - start + 1);
+}
+
+static std::string normalize_host_header_value(const std::string& host_value)
+{
+	std::string host = trim_copy(host_value);
+	if (host.empty())
+		return "";
+	if (host[0] == '[')
+	{
+		size_t bracket_end = host.find(']');
+		if (bracket_end != std::string::npos)
+			host = host.substr(1, bracket_end - 1);
+		return to_lower_copy(host);
+	}
+	size_t colon = host.find(':');
+	if (colon != std::string::npos)
+		host = host.substr(0, colon);
+	return to_lower_copy(host);
+}
+
+static bool load_custom_error_page_body(const ServerConfig& srv, int status_code, std::string& body_out)
+{
+	std::map<int, std::string>::const_iterator it = srv._error_pages.find(status_code);
+	if (it == srv._error_pages.end())
+		return false;
+	std::string filepath;
+	bool root_has_slash = (!srv._root.empty() && srv._root[srv._root.size() - 1] == '/');
+	bool page_has_slash = (!it->second.empty() && it->second[0] == '/');
+	if (root_has_slash && page_has_slash)
+		filepath = srv._root + it->second.substr(1);
+	else if (!root_has_slash && !page_has_slash)
+		filepath = srv._root + "/" + it->second;
+	else
+		filepath = srv._root + it->second;
+
+	std::ifstream file(filepath.c_str());
+	if (!file.is_open())
+		return false;
+	std::stringstream buffer;
+	buffer << file.rdbuf();
+	body_out = buffer.str();
+	return true;
 }
 
 static std::string reason_phrase_from_status(int status)
@@ -144,9 +185,15 @@ void server::start_listening(Config& servers)
 	for (size_t idx = 0; idx < servers._servers.size(); ++idx)
 	{
 		ServerConfig& srv = servers._servers[idx];
+		if (_port_socket.find(srv._port) != _port_socket.end())
+		{
+			has_listener = true;
+			continue;
+		}
 		struct addrinfo hints, *res, *p;
 		int ra;
 		int yes = 1;
+		int listen_fd = -1;
 		std::stringstream ss;
 		ss << srv._port;
 		std::string port = ss.str();
@@ -161,21 +208,23 @@ void server::start_listening(Config& servers)
 		}
 		for(p = res; p != NULL; p = p->ai_next)
 		{
-			_port_socket[srv._port] = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-			if(_port_socket[srv._port]== -1)
+			listen_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+			if(listen_fd == -1)
 			{
 				std::cerr << "srv [socket] " << std::endl;
 				continue;
 			}
-			if (setsockopt(_port_socket[srv._port], SOL_SOCKET, SO_REUSEADDR, &yes ,sizeof(int)) == -1)
+			if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes ,sizeof(int)) == -1)
 			{
 				std::cerr << "srv [setsockopt]" << std::endl;
-				close(_port_socket[srv._port]);
+				close(listen_fd);
+				listen_fd = -1;
 				continue;
 			}
-			if (bind(_port_socket[srv._port], p->ai_addr, p->ai_addrlen) == -1)
+			if (bind(listen_fd, p->ai_addr, p->ai_addrlen) == -1)
 			{
-				close(_port_socket[srv._port]);
+				close(listen_fd);
+				listen_fd = -1;
 				std::cerr << "srv [Bind]" << std::endl;
 				continue;
 			}
@@ -183,24 +232,25 @@ void server::start_listening(Config& servers)
 		}
 		freeaddrinfo(res);
 
-		if (p == NULL)
+		if (p == NULL || listen_fd == -1)
 		{
 			std::cerr << "server failed to bind" << std::endl;
 			continue;
 		}
-		if (listen(_port_socket[srv._port], 10) == -1)
+		if (listen(listen_fd, 10) == -1)
 		{
 			std::cerr << "Listen" << std::endl;
-			close(_port_socket[srv._port]);
+			close(listen_fd);
 			continue;
 		}
-		if (fcntl(_port_socket[srv._port], F_SETFL, O_NONBLOCK) == -1)
+		if (fcntl(listen_fd, F_SETFL, O_NONBLOCK) == -1)
 		{
-			close(_port_socket[srv._port]);
+			close(listen_fd);
 			continue;
 		}
-		poll_setup(_port_socket[srv._port]);
-		_listener_to_server[_port_socket[srv._port]] = static_cast<int>(idx);
+		_port_socket[srv._port] = listen_fd;
+		poll_setup(listen_fd);
+		_listener_to_server[listen_fd] = static_cast<int>(idx);
 		has_listener = true;
 	}
 	if (!has_listener)
@@ -214,7 +264,6 @@ void server::poll_setup(int newfd)
 	pfd.events = POLLIN;
 	pfd.revents = 0;
 	_fds.push_back(pfd);
-
 }
 
 void HTTPRequest::Validate(const std::string& buf)
@@ -395,7 +444,8 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv, const 
 	body_GET(full_path);
 	if (_statusCode == 404)
 	{
-		_body = "<html><body><h1>404 Not Found</h1></body></html>";
+		if (!load_custom_error_page_body(srv, 404, _body))
+			_body = "<html><body><h1>404 Not Found</h1></body></html>";
 		_contentType = "text/html";
 	}
 	construct_response(req);
@@ -850,6 +900,54 @@ bool server::get_keep_alive(const HTTPRequest& req) const
 	return keep_alive;
 }
 
+int server::resolve_server_index(int client_fd, const HTTPRequest& req, const Config& servers) const
+{
+	int default_idx = 0;
+	std::map<int, int>::const_iterator c_it = _client_to_server.find(client_fd);
+	if (c_it != _client_to_server.end() && c_it->second >= 0 && static_cast<size_t>(c_it->second) < servers._servers.size())
+		default_idx = c_it->second;
+
+	int target_port = -1;
+	if (default_idx >= 0 && static_cast<size_t>(default_idx) < servers._servers.size())
+		target_port = servers._servers[default_idx]._port;
+	if (target_port < 0)
+	{
+		struct sockaddr_in local_addr;
+		socklen_t local_len = sizeof(local_addr);
+		if (getsockname(client_fd, reinterpret_cast<struct sockaddr*>(&local_addr), &local_len) == 0)
+			target_port = ntohs(local_addr.sin_port);
+	}
+	if (target_port < 0)
+		return 0;
+
+	std::string host_name;
+	const std::map<std::string, std::string>& headers = req.getMap();
+	std::map<std::string, std::string>::const_iterator h_it = headers.find("host");
+	if (h_it != headers.end())
+		host_name = normalize_host_header_value(h_it->second);
+
+	int first_on_port = -1;
+	for (size_t i = 0; i < servers._servers.size(); ++i)
+	{
+		const ServerConfig& candidate = servers._servers[i];
+		if (candidate._port != target_port)
+			continue;
+		if (first_on_port == -1)
+			first_on_port = static_cast<int>(i);
+		for (size_t j = 0; j < candidate._server_names.size(); ++j)
+		{
+			if (to_lower_copy(candidate._server_names[j]) == host_name)
+				return static_cast<int>(i);
+		}
+	}
+
+	if (default_idx >= 0 && static_cast<size_t>(default_idx) < servers._servers.size() && servers._servers[default_idx]._port == target_port)
+		return default_idx;
+	if (first_on_port != -1)
+		return first_on_port;
+	return 0;
+}
+
 void server::set_client_events(int client_fd, short events)
 {
 	for (size_t k = 0; k < _fds.size(); ++k)
@@ -877,9 +975,9 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 		LocationConfig& loc = srv._locations[j];
 		if (loc._path.empty())
 			continue;
-		if (uri_path.compare(0, loc._path.size(), loc._path) != 0)
+		if (uri_path.compare(0, loc._path.size(), loc._path) != 0) //uri:abcd/ loc:abc/
 			continue;
-		if (uri_path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && uri_path[loc._path.size()] != '/')
+		if (uri_path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && uri_path[loc._path.size()] != '/') //directory?
 			continue;
 		if (loc._path.size() >= best_len)
 		{
@@ -887,7 +985,6 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 			best_loc = &loc;
 		}
 	}
-
 	if (best_loc == NULL)
 	{
 		for (size_t j = 0; j < srv._locations.size(); ++j)
@@ -899,14 +996,12 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 			}
 		}
 	}
-
 	if (best_loc == NULL)
 		return false;
 	if (best_loc->_return_code > 0 && !best_loc->_return_url.empty())
-		return false;
+		return false;//manage redirect somewhere else
 	if (req.getMethod() != "GET" && req.getMethod() != "POST")
 		return false;
-
 	bool method_found = false;
 	for (size_t k = 0; k < best_loc->_allowed_methods.size(); ++k)
 	{
@@ -920,7 +1015,6 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 		return false;
 	if (best_loc->_cgi_path.empty() || best_loc->_cgi_ext.empty())
 		return false;
-
 	size_t dot = uri_path.find_last_of('.');
 	if (dot == std::string::npos)
 		return false;
@@ -966,10 +1060,9 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 			if (script_path.size() > 2 && script_path.substr(0, 2) == "./")
 				script_path = base + script_path.substr(2);
 			else
-				script_path = base + script_path;
+				script_path = base + script_path; //absolute path
 		}
 	}
-
 	struct stat script_stat;
 	if (stat(script_path.c_str(), &script_stat) != 0 || S_ISDIR(script_stat.st_mode))
 	{
@@ -989,7 +1082,6 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		set_client_events(client_fd, POLLIN | POLLOUT);
 		return false;
 	}
-
 	std::string request_body;
 	bool is_post = (req.getMethod() == "POST");
 	if (is_post)
@@ -1018,11 +1110,12 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		else
 			request_body = req.getBody();
 	}
-
 	int out_fd[2];
 	int in_fd[2];
 	in_fd[0] = -1;
 	in_fd[1] = -1;
+	out_fd[0] = -1;
+	out_fd[1] = -1;
 	if (pipe(out_fd) == -1)
 	{
 		HTTPResponse err;
@@ -1032,7 +1125,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		set_client_events(client_fd, POLLIN | POLLOUT);
 		return false;
 	}
-	if (is_post && pipe(in_fd) == -1)
+	if (is_post && pipe(in_fd) == -1)//we never create a in_pipe if it is not a post method
 	{
 		close(out_fd[0]);
 		close(out_fd[1]);
@@ -1043,7 +1136,6 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		set_client_events(client_fd, POLLIN | POLLOUT);
 		return false;
 	}
-
 	std::string env_method = "REQUEST_METHOD=" + req.getMethod();
 	std::string env_query = "QUERY_STRING=";
 	size_t q = req.getUri().find('?');
@@ -1052,7 +1144,6 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	std::string env_script = "SCRIPT_FILENAME=" + script_path;
 	std::string env_content_length = "CONTENT_LENGTH=0";
 	std::string env_content_type = "CONTENT_TYPE=";
-
 	if (is_post)
 	{
 		std::stringstream ss;
@@ -1071,12 +1162,10 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	envp.push_back(const_cast<char*>(env_content_length.c_str()));
 	envp.push_back(const_cast<char*>(env_content_type.c_str()));
 	envp.push_back(NULL);
-
 	char* args[3];
-	args[0] = const_cast<char*>(loc._cgi_path.c_str());
-	args[1] = const_cast<char*>(script_path.c_str());
+	args[0] = const_cast<char*>(loc._cgi_path.c_str());//e.g python
+	args[1] = const_cast<char*>(script_path.c_str());//script
 	args[2] = NULL;
-
 	pid_t pid = fork();
 	if (pid == -1)
 	{
@@ -1094,11 +1183,15 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		set_client_events(client_fd, POLLIN | POLLOUT);
 		return false;
 	}
+	//Child -> POST (read & write <=> in_fd[0] & out_fd[1])
+	//Child -> GET (write <=> out_fd[1])
+	//Parent -> POST (read & write <=> out_fd[0] & in_fd[1])
+	//Parent -> GET (read <=> out_fd[0])
 	if (pid == 0)
 	{
 		if (is_post)
 		{
-			close(in_fd[1]);
+			close(in_fd[1]);//child want to read data from parent, save result to the HD and write data to parent using out_fd[1]
 			if (dup2(in_fd[0], STDIN_FILENO) == -1)
 				_exit(1);
 			close(in_fd[0]);
@@ -1112,11 +1205,10 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 				_exit(1);
 			close(null_fd);
 		}
-		close(out_fd[0]);
+		close(out_fd[0]);//child will not read anything to the parent using out_fd
 		if (dup2(out_fd[1], STDOUT_FILENO) == -1)
 			_exit(1);
 		close(out_fd[1]);
-
 		size_t slash = script_path.find_last_of('/');
 		std::string script_dir = ".";
 		if (slash != std::string::npos)
@@ -1127,18 +1219,15 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		}
 		if (chdir(script_dir.c_str()) == -1)
 			_exit(1);
-
 		execve(args[0], args, &envp[0]);
 		_exit(1);
-	}
-
-	close(out_fd[1]);
+	} //child ended
+	close(out_fd[1]); //closing child ends
 	if (is_post)
 		close(in_fd[0]);
-
 	if (fcntl(out_fd[0], F_SETFL, O_NONBLOCK) == -1)
 	{
-		close(out_fd[0]);
+		close(out_fd[0]);//closing parent ends
 		if (is_post)
 			close(in_fd[1]);
 		kill(pid, SIGKILL);
@@ -1163,7 +1252,6 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		set_client_events(client_fd, POLLIN | POLLOUT);
 		return false;
 	}
-
 	CgiJob job;
 	job.client_fd = client_fd;
 	job.server_index = server_index;
@@ -1176,15 +1264,12 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	job.start_ms = now_ms();
 	job.child_done = false;
 	job.child_status = 0;
-
-	if (job.in_fd != -1 && job.request_body.empty())
+	if (job.in_fd != -1 && job.request_body.empty()) //POST without a body
 	{
 		close(job.in_fd);
 		job.in_fd = -1;
 	}
-
 	_cgi_jobs[client_fd] = job;
-
 	if (job.in_fd != -1)
 	{
 		struct pollfd in_pfd;
@@ -1194,14 +1279,12 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		_fds.push_back(in_pfd);
 		_cgi_in_to_client[job.in_fd] = client_fd;
 	}
-
 	struct pollfd out_pfd;
 	out_pfd.fd = job.out_fd;
 	out_pfd.events = POLLIN;
 	out_pfd.revents = 0;
 	_fds.push_back(out_pfd);
 	_cgi_out_to_client[job.out_fd] = client_fd;
-
 	set_client_events(client_fd, 0);
 	return true;
 }
@@ -1295,13 +1378,11 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 	bool is_out_pipe = (_cgi_out_to_client.find(fd) != _cgi_out_to_client.end());
 	if (!is_in_pipe && !is_out_pipe)
 		return;
-
 	int client_fd = -1;
 	if (is_in_pipe)
 		client_fd = _cgi_in_to_client[fd];
 	else
 		client_fd = _cgi_out_to_client[fd];
-
 	std::map<int, CgiJob>::iterator it = _cgi_jobs.find(client_fd);
 	if (it == _cgi_jobs.end())
 	{
@@ -1315,7 +1396,6 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 	}
 	CgiJob& job = it->second;
 	short revents = _fds[i].revents;
-
 	if (is_in_pipe)
 	{
 		if (revents & (POLLERR | POLLHUP | POLLNVAL))
@@ -1488,7 +1568,6 @@ void HTTPResponse::build_error_response(int status_code, ServerConfig& srv)
         ss << "<hr><center>webserv/1.0</center>\r\n";
         ss << "</body>\r\n";
         ss << "</html>\r\n";
-        
         body_str = ss.str();
 	}
 	response << "HTTP/1.1 " << status_code << " " << reason_phrase << "\r\n";
@@ -1506,7 +1585,6 @@ void server::srv_manage(Config& servers)
 	{
 		if (_fds.empty())
 			continue;
-
 		if (poll(&_fds[0], _fds.size(), TOUT) == -1)
 		{
 			if (errno == EINTR)
@@ -1514,7 +1592,6 @@ void server::srv_manage(Config& servers)
 			std::cerr << "Poll" << std::endl;
 			continue;
 		}
-
 		std::vector<int> timed_out_clients;
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
@@ -1524,27 +1601,26 @@ void server::srv_manage(Config& servers)
 		}
 		for (size_t t = 0; t < timed_out_clients.size(); ++t)
 			finalize_cgi_job(timed_out_clients[t], servers, false, 500);
-
 		size_t i = 0;
 		for(i = 0; i < _fds.size(); i++)
 		{
-			if (_fds[i].fd < 0)
+			if (_fds[i].fd < 0) //connection closed
 				continue;
-			if (_cgi_in_to_client.find(_fds[i].fd) != _cgi_in_to_client.end() || _cgi_out_to_client.find(_fds[i].fd) != _cgi_out_to_client.end())
+			if (_cgi_in_to_client.find(_fds[i].fd) != _cgi_in_to_client.end() || _cgi_out_to_client.find(_fds[i].fd) != _cgi_out_to_client.end()) //pipe
 			{
 				process_cgi_pipe_event(i, servers);
 				continue;
 			}
-			if (_fds[i].revents & POLLIN)
+			if (_fds[i].revents & POLLIN) //client
 			{
 				struct sockaddr_storage the_addr;
 				socklen_t len = sizeof the_addr;
 				char s[INET6_ADDRSTRLEN];
 				int client_fd = _fds[i].fd;
-				std::map<int, int>::iterator listener_it = _listener_to_server.find(client_fd);
+				std::map<int, int>::iterator listener_it = _listener_to_server.find(client_fd); //socket-server map
 				bool is_listener = (listener_it != _listener_to_server.end());
 
-				if (is_listener)
+				if (is_listener) //new client
 				{
 					int cnxfd = accept(client_fd, reinterpret_cast<sockaddr*>(&the_addr), &len);
 					if (cnxfd == -1)
@@ -1563,13 +1639,12 @@ void server::srv_manage(Config& servers)
 					inet_ntop(the_addr.ss_family, get_addr_type(reinterpret_cast<sockaddr*>(&the_addr)), s, sizeof s);
 					std::cout << "srv: new connection from " << s << " on fd " << cnxfd << " (Total clients: " << _fds.size() - 1 << ")" << std::endl;
 				}
-				if (!is_listener)
+				if (!is_listener) //exiting client
 				{
 					if (_cgi_jobs.find(client_fd) != _cgi_jobs.end())
 						continue;
 					char buf[BUFF_SIZE];
 					int nbytes = recv(client_fd, buf, BUFF_SIZE - 1, 0);
-
 					if (nbytes <= 0)
 					{
 						if(nbytes == 0)
@@ -1596,12 +1671,7 @@ void server::srv_manage(Config& servers)
 						    std::cerr << "Request Failed: " << e.what() << std::endl;
 						
 						    HTTPResponse error_res;
-							int s_idx = 0;
-							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
-							if (s_it != _client_to_server.end())
-								s_idx = s_it->second;
-							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
-								s_idx = 0;
+							int s_idx = resolve_server_index(client_fd, current_req, servers);
 						    error_res.build_error_response(status_code, servers._servers[s_idx]);
 						    std::string raw = error_res.get_raw_response();
 							_pending_response[client_fd] = raw;
@@ -1610,12 +1680,7 @@ void server::srv_manage(Config& servers)
 						}
 						if (current_req.IsParsed() && _pending_response.find(client_fd) == _pending_response.end() && _cgi_jobs.find(client_fd) == _cgi_jobs.end())
 						{
-							int s_idx = 0;
-							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
-							if (s_it != _client_to_server.end())
-								s_idx = s_it->second;
-							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
-								s_idx = 0;
+							int s_idx = resolve_server_index(client_fd, current_req, servers);
 							LocationConfig* cgi_loc = NULL;
 							std::string uri_path;
 							if (is_cgi_request(current_req, servers._servers[s_idx], cgi_loc, uri_path))
@@ -1653,12 +1718,7 @@ void server::srv_manage(Config& servers)
 						_requests[client_fd].consume_parsed_request();
 						if(_requests[client_fd].IsParsed() == true)
 						{
-							int s_idx = 0;
-							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
-							if (s_it != _client_to_server.end())
-								s_idx = s_it->second;
-							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
-								s_idx = 0;
+							int s_idx = resolve_server_index(client_fd, _requests[client_fd], servers);
 							LocationConfig* cgi_loc = NULL;
 							std::string uri_path;
 							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], cgi_loc, uri_path))
@@ -1700,12 +1760,7 @@ void server::srv_manage(Config& servers)
 						_requests[client_fd].consume_parsed_request();
 						if(_requests[client_fd].IsParsed() == true)
 						{
-							int s_idx = 0;
-							std::map<int, int>::iterator s_it = _client_to_server.find(client_fd);
-							if (s_it != _client_to_server.end())
-								s_idx = s_it->second;
-							if (s_idx < 0 || static_cast<size_t>(s_idx) >= servers._servers.size())
-								s_idx = 0;
+							int s_idx = resolve_server_index(client_fd, _requests[client_fd], servers);
 							LocationConfig* cgi_loc = NULL;
 							std::string uri_path;
 							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], cgi_loc, uri_path))

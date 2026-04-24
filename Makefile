@@ -3,7 +3,7 @@ NAME = webserv
 CXX = c++
 CXXFLAGS = -Wall -Wextra -Werror -std=c++98
 
-SRCS = practice/ml5.cpp
+SRCS = webserv.cpp
 OBJS = $(SRCS:.cpp=.o)
 
 all: $(NAME)
