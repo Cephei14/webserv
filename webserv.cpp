@@ -1,6 +1,6 @@
 #include "webserv.hpp"
-static volatile sig_atomic_t signaled = 0;
 
+static volatile sig_atomic_t signaled = 0;
 static const size_t MAX_REQUEST_LINE_BYTES = 8192;
 static const size_t MAX_URI_BYTES = 8192;
 static const size_t MAX_HEADER_BLOCK_BYTES = 65536;
