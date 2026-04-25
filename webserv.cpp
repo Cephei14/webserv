@@ -48,6 +48,44 @@ static std::string normalize_host_header_value(const std::string& host_value)
 	return to_lower_copy(host);
 }
 
+static LocationConfig* find_best_location_for_path(ServerConfig& srv, const std::string& uri)
+{
+	std::string path = uri;
+	size_t q = path.find('?');
+	if (q != std::string::npos)
+		path = path.substr(0, q);
+
+	LocationConfig* best_loc = NULL;
+	size_t best_len = 0;
+	for (size_t j = 0; j < srv._locations.size(); ++j)
+	{
+		LocationConfig& loc = srv._locations[j];
+		if (loc._path.empty())
+			continue;
+		if (path.compare(0, loc._path.size(), loc._path) != 0)
+			continue;
+		if (path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && path[loc._path.size()] != '/')
+			continue;
+		if (loc._path.size() >= best_len)
+		{
+			best_len = loc._path.size();
+			best_loc = &loc;
+		}
+	}
+	if (best_loc == NULL)
+	{
+		for (size_t j = 0; j < srv._locations.size(); ++j)
+		{
+			if (srv._locations[j]._path == "/")
+			{
+				best_loc = &srv._locations[j];
+				break;
+			}
+		}
+	}
+	return best_loc;
+}
+
 static bool load_custom_error_page_body(const ServerConfig& srv, int status_code, std::string& body_out)
 {
 	std::map<int, std::string>::const_iterator it = srv._error_pages.find(status_code);
@@ -424,9 +462,12 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv, const 
 	bool is_dir = (stat(full_path.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
 	if (is_dir)
 	{
+		bool index_checked = false;
+		bool index_found = false;
 		const std::vector<std::string>& idx = loc._index.empty() ? srv._index : loc._index;
 		if (!idx.empty())
 		{
+			index_checked = true;
 			std::string index_path = full_path;
 			if (index_path[index_path.size() - 1] != '/')
 				index_path += "/";
@@ -435,14 +476,24 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv, const 
 			body_GET(index_path);
 			if (_statusCode != 404)
 			{
+				index_found = true;
 				construct_response(req);
 				return;
 			}
 		}
 		if (!loc._autoindex)
 		{
-			_statusCode = 403;
-			_body = "<html><body><h1>403 Forbidden</h1></body></html>";
+			if (index_checked && !index_found)
+			{
+				_statusCode = 404;
+				if (!load_custom_error_page_body(srv, 404, _body))
+					_body = "<html><body><h1>404 Not Found</h1></body></html>";
+			}
+			else
+			{
+				_statusCode = 403;
+				_body = "<html><body><h1>403 Forbidden</h1></body></html>";
+			}
 			_contentType = "text/html";
 			construct_response(req);
 			return;
@@ -1175,10 +1226,15 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		return false;
 	}
 	std::string env_method = "REQUEST_METHOD=" + req.getMethod();
+	std::string env_gateway = "GATEWAY_INTERFACE=CGI/1.1";
+	std::string env_server_protocol = "SERVER_PROTOCOL=" + req.getVersion();
 	std::string env_query = "QUERY_STRING=";
 	size_t q = req.getUri().find('?');
 	if (q != std::string::npos)
 		env_query += req.getUri().substr(q + 1);
+	std::string env_request_uri = "REQUEST_URI=" + req.getUri();
+	std::string env_script_name = "SCRIPT_NAME=" + uri_path;
+	std::string env_path_info = "PATH_INFO=" + uri_path;
 	std::string env_script = "SCRIPT_FILENAME=" + script_path;
 	std::string env_content_length = "CONTENT_LENGTH=0";
 	std::string env_content_type = "CONTENT_TYPE=";
@@ -1195,7 +1251,12 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 
 	std::vector<char*> envp;
 	envp.push_back(const_cast<char*>(env_method.c_str()));
+	envp.push_back(const_cast<char*>(env_gateway.c_str()));
+	envp.push_back(const_cast<char*>(env_server_protocol.c_str()));
 	envp.push_back(const_cast<char*>(env_query.c_str()));
+	envp.push_back(const_cast<char*>(env_request_uri.c_str()));
+	envp.push_back(const_cast<char*>(env_script_name.c_str()));
+	envp.push_back(const_cast<char*>(env_path_info.c_str()));
 	envp.push_back(const_cast<char*>(env_script.c_str()));
 	envp.push_back(const_cast<char*>(env_content_length.c_str()));
 	envp.push_back(const_cast<char*>(env_content_type.c_str()));
@@ -1715,6 +1776,30 @@ void server::srv_manage(Config& servers)
 						try
 						{
 							current_req.AddRawP(buf, nbytes);
+							if (current_req.getMethod() == "POST" && !current_req.IsParsed())
+							{
+								const std::map<std::string, std::string>& hdrs = current_req.getMap();
+								std::map<std::string, std::string>::const_iterator cl_it = hdrs.find("content-length");
+								if (cl_it != hdrs.end())
+								{
+									unsigned long declared_len = std::strtoul(cl_it->second.c_str(), NULL, 10);
+									int s_idx = resolve_server_index(client_fd, current_req, servers);
+									ServerConfig& selected_srv = servers._servers[s_idx];
+									size_t limit = selected_srv._client_max_body_size;
+									LocationConfig* matched_loc = find_best_location_for_path(selected_srv, current_req.getUri());
+									if (matched_loc != NULL && matched_loc->_client_max_body_size > 0)
+										limit = matched_loc->_client_max_body_size;
+									if (declared_len > limit)
+									{
+										HTTPResponse too_large_res;
+										too_large_res.build_error_response(413, selected_srv);
+										_pending_response[client_fd] = too_large_res.get_raw_response();
+										_fd_keep_alive[client_fd] = false;
+										_fds[i].events = POLLOUT;
+										continue;
+									}
+								}
+							}
 						}
 						catch(const std::exception& e)
 						{
@@ -1730,7 +1815,7 @@ void server::srv_manage(Config& servers)
 						    std::string raw = error_res.get_raw_response();
 							_pending_response[client_fd] = raw;
 							_fd_keep_alive[client_fd] = false;
-							_fds[i].events = POLLIN | POLLOUT;
+							_fds[i].events = POLLOUT;
 						}
 						if (current_req.IsParsed() && _pending_response.find(client_fd) == _pending_response.end() && _cgi_jobs.find(client_fd) == _cgi_jobs.end())
 						{
