@@ -1,6 +1,10 @@
 #include "webserv.hpp"
 static volatile sig_atomic_t signaled = 0;
 
+static const size_t MAX_REQUEST_LINE_BYTES = 8192;
+static const size_t MAX_URI_BYTES = 8192;
+static const size_t MAX_HEADER_BLOCK_BYTES = 65536;
+
 static long now_ms()
 {
 	struct timeval tv;
@@ -85,6 +89,7 @@ static std::string reason_phrase_from_status(int status)
 		case 405: return "Method Not Allowed";
 		case 411: return "Length Required";
 		case 413: return "Payload Too Large";
+		case 414: return "URI Too Long";
 		case 500: return "Internal Server Error";
 		case 501: return "Not Implemented";
 		case 505: return "HTTP Version Not Supported";
@@ -273,27 +278,45 @@ void HTTPRequest::Validate(const std::string& buf)
 	{
 		size_t n = buf.find("\r\n");
 		if(n == std::string::npos)
+		{
+			if (buf.size() > MAX_REQUEST_LINE_BYTES)
+				throw std::runtime_error("414 URI Too Long");
 			return;
+		}
+		if (n > MAX_REQUEST_LINE_BYTES)
+			throw std::runtime_error("414 URI Too Long");
 		std::string requestLine = buf.substr(0, n);
 		size_t pos = requestLine.find(' ');
-		if(pos == std::string::npos)
+		if(pos == std::string::npos || pos == 0 || pos + 1 >= requestLine.size() || requestLine[pos + 1] == ' ')
 			throw std::runtime_error("400 Bad Request");
 		_method = requestLine.substr(0, pos);
 		if (_method != "POST" && _method != "GET" && _method != "DELETE")
 			throw std::runtime_error("501 Not Implemented");
 		size_t m = requestLine.find(' ', pos + 1);
-		if(m == std::string::npos)
+		if(m == std::string::npos || m <= pos + 1 || m + 1 >= requestLine.size() || requestLine[m + 1] == ' ')
+			throw std::runtime_error("400 Bad Request");
+		if (requestLine.find(' ', m + 1) != std::string::npos)
 			throw std::runtime_error("400 Bad Request");
 		_uri = requestLine.substr(pos + 1, m - pos - 1);
-		if (!_uri.empty() && _uri[0] != '/')
+		if (_uri.empty() || _uri[0] != '/')
 			throw std::runtime_error("400 Bad Request");
-		_version = requestLine.substr(m + 1, n - m - 1);
+		if (_uri.size() > MAX_URI_BYTES)
+			throw std::runtime_error("414 URI Too Long");
+		_version = requestLine.substr(m + 1);
 		if (_version != "HTTP/1.1")
 			throw std::runtime_error("505 HTTP Version Not Supported");
 
 		std::string allowed_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-";	
 		if (end_of_headers == std::string::npos)
+		{
+			if (buf.size() > MAX_HEADER_BLOCK_BYTES)
+				throw std::runtime_error("400 Bad Request");
 			return;
+		}
+		if (end_of_headers + 4 > MAX_HEADER_BLOCK_BYTES)
+			throw std::runtime_error("400 Bad Request");
+		bool has_content_length_header = false;
+		std::string first_content_length_value;
 		std::string Header = buf.substr(n + 2, end_of_headers - (n + 2) + 2); 
 		while (Header != "\r\n" && !Header.empty()) 
 		{
@@ -303,7 +326,7 @@ void HTTPRequest::Validate(const std::string& buf)
 			if (colon == std::string::npos)
 				throw std::runtime_error("400 Bad Request");
 			std::string Key = Line.substr(0, colon);
-			if (Key.find_first_not_of(allowed_chars) != std::string::npos)
+			if (Key.empty() || Key.find_first_not_of(allowed_chars) != std::string::npos)
 				throw std::runtime_error("400 Bad Request");
 			for (size_t i = 0; i < Key.length(); i++)
 				Key[i] = (char)tolower(Key[i]);
@@ -314,6 +337,18 @@ void HTTPRequest::Validate(const std::string& buf)
 			size_t end = Value.find_last_not_of(" \t");
 			if(end != std::string::npos)
 				Value = Value.substr(0, end + 1);
+			if (Key == "content-length")
+			{
+				if (Value.empty() || Value.find_first_not_of("0123456789") != std::string::npos)
+					throw std::runtime_error("400 Bad Request");
+				if (has_content_length_header && first_content_length_value != Value)
+					throw std::runtime_error("400 Bad Request");
+				unsigned long parsed_len = std::strtoul(Value.c_str(), NULL, 10);
+				if (parsed_len > 2147483647UL)
+					throw std::runtime_error("400 Bad Request");
+				has_content_length_header = true;
+				first_content_length_value = Value;
+			}
 			_headers[Key] = Value;
 			Header.erase(0, line_end + 2);
 		}
@@ -322,24 +357,29 @@ void HTTPRequest::Validate(const std::string& buf)
 		_headersParsed = true;
 	}
 	size_t body_start = end_of_headers + 4;
-	if (_headers.find("content-length") != _headers.end())
+	bool has_transfer_encoding = (_headers.find("transfer-encoding") != _headers.end());
+	bool has_content_length = (_headers.find("content-length") != _headers.end());
+	if (_method == "POST")
 	{
-	    long content_length = std::atol(_headers["content-length"].c_str());
-		size_t required_end = body_start + content_length;
-		if(_raw_buf.size() < required_end)
-			return;
-		_parsed_request_end = required_end;
-	    _isParsed = true;
-	}
-	else if (_method == "POST" && _headers.find("transfer-encoding") == _headers.end())
-	    throw std::runtime_error("411 Length Required");
-	else if (_method == "POST" && _headers.find("transfer-encoding") != _headers.end())
-	{
-		size_t chunk_end = _raw_buf.find("0\r\n\r\n", body_start);
-		if (chunk_end == std::string::npos)
-			return;
-		_parsed_request_end = chunk_end + 5;
-		_isParsed = true;
+		if (has_transfer_encoding)
+		{
+			size_t chunk_end = _raw_buf.find("0\r\n\r\n", body_start);
+			if (chunk_end == std::string::npos)
+				return;
+			_parsed_request_end = chunk_end + 5;
+			_isParsed = true;
+		}
+		else if (has_content_length)
+		{
+			long content_length = std::atol(_headers["content-length"].c_str());
+			size_t required_end = body_start + static_cast<size_t>(content_length);
+			if(_raw_buf.size() < required_end)
+				return;
+			_parsed_request_end = required_end;
+			_isParsed = true;
+		}
+		else
+		    throw std::runtime_error("411 Length Required");
 	}
 	else
 	{
@@ -560,6 +600,8 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 			_reason = "Length Required";
 		else if (_statusCode == 413)
 			_reason = "Payload Too Large";
+		else if (_statusCode == 414)
+			_reason = "URI Too Long";
 		else if (_statusCode == 501)
 			_reason = "Not Implemented";
 		else if (_statusCode == 505)
@@ -1526,6 +1568,7 @@ void HTTPResponse::build_error_response(int status_code, ServerConfig& srv)
         case 405: reason_phrase = "Method Not Allowed"; break;
         case 411: reason_phrase = "Length Required"; break;
         case 413: reason_phrase = "Payload Too Large"; break;
+		case 414: reason_phrase = "URI Too Long"; break;
         case 500: reason_phrase = "Internal Server Error"; break;
         case 501: reason_phrase = "Not Implemented"; break;
         case 505: reason_phrase = "HTTP Version Not Supported"; break;
