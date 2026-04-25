@@ -23,7 +23,7 @@ make
 Run:
 
 ```bash
-../webserv webserv.conf
+./webserv webserv.conf
 ```
 
 Quick checks:
