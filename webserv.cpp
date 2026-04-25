@@ -290,7 +290,7 @@ void HTTPRequest::Validate(const std::string& buf)
 		if(pos == std::string::npos || pos == 0 || pos + 1 >= requestLine.size() || requestLine[pos + 1] == ' ')
 			throw std::runtime_error("400 Bad Request");
 		_method = requestLine.substr(0, pos);
-		if (_method != "POST" && _method != "GET" && _method != "DELETE")
+		if (_method != "POST" && _method != "GET" && _method != "HEAD" && _method != "DELETE")
 			throw std::runtime_error("501 Not Implemented");
 		size_t m = requestLine.find(' ', pos + 1);
 		if(m == std::string::npos || m <= pos + 1 || m + 1 >= requestLine.size() || requestLine[m + 1] == ' ')
@@ -624,7 +624,8 @@ void HTTPResponse::construct_response(const HTTPRequest& req)
 	else
 		response_stream << "Connection: keep-alive\r\n";
 	response_stream << "\r\n";
-	response_stream << _body;
+	if (req.getMethod() != "HEAD")
+		response_stream << _body;
 	_final_response = response_stream.str();
 }
 
@@ -902,22 +903,21 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 			}
 		}
 	}
-	if(req.getMethod() == "GET" && !is_cgi)
+	if((req.getMethod() == "GET" || req.getMethod() == "HEAD") && !is_cgi)
 		prepare_GET(req, srv, *best_loc);
 	else if(req.getMethod() == "POST" && !is_cgi)
 	{
-		if(req.getBody().size() <= srv._client_max_body_size)
+		size_t limit = (best_loc && best_loc->_client_max_body_size > 0) 
+		               ? best_loc->_client_max_body_size 
+		               : srv._client_max_body_size;
+
+		if(req.getBody().size() <= limit)
 			prepare_POST(req, srv, *best_loc);
 		else
 		{
 			_statusCode = 413;
 			build_error_response(_statusCode, srv);
 		}
-	}
-	else if(is_cgi && (req.getMethod() == "GET" || req.getMethod() == "POST"))
-	{
-		_statusCode = 500;
-		build_error_response(_statusCode, srv);
 	}
 	else if(req.getMethod() == "DELETE")
 		prepare_DELETE(req, srv, *best_loc);
@@ -1201,7 +1201,22 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	envp.push_back(const_cast<char*>(env_content_type.c_str()));
 	envp.push_back(NULL);
 	char* args[3];
-	args[0] = const_cast<char*>(loc._cgi_path.c_str());//e.g python
+	std::string abs_cgi_path = loc._cgi_path;
+	if (!abs_cgi_path.empty() && abs_cgi_path[0] != '/')
+	{
+		char cwd[4096];
+		if (getcwd(cwd, sizeof(cwd)) != NULL)
+		{
+			std::string base = cwd;
+			if (!base.empty() && base[base.size() - 1] != '/')
+				base += "/";
+			if (abs_cgi_path.size() > 2 && abs_cgi_path.substr(0, 2) == "./")
+				abs_cgi_path = base + abs_cgi_path.substr(2);
+			else
+				abs_cgi_path = base + abs_cgi_path;
+		}
+	}
+	args[0] = const_cast<char*>(abs_cgi_path.c_str());//e.g python
 	args[1] = const_cast<char*>(script_path.c_str());//script
 	args[2] = NULL;
 	pid_t pid = fork();
@@ -1583,9 +1598,9 @@ void HTTPResponse::build_error_response(int status_code, ServerConfig& srv)
 		if (r_slash && p_slash)
 			filepath = srv._root + it->second.substr(1);
 		else if (!r_slash && !p_slash)
-			filepath = srv._root + "/" +it->second.substr(1);
+			filepath = srv._root + "/" + it->second;
 		else	
-			filepath = srv._root + it->second.substr(1);
+			filepath = srv._root + it->second;
         
         std::ifstream file(filepath.c_str());
         if (file.is_open()) 
@@ -1724,6 +1739,16 @@ void server::srv_manage(Config& servers)
 							std::string uri_path;
 							if (is_cgi_request(current_req, servers._servers[s_idx], cgi_loc, uri_path))
 							{
+								size_t limit = (cgi_loc && cgi_loc->_client_max_body_size > 0)
+								               ? cgi_loc->_client_max_body_size
+								               : servers._servers[s_idx]._client_max_body_size;
+								if (current_req.getBody().size() > limit)
+								{
+									_responses[client_fd].build_error_response(413, servers._servers[s_idx]);
+									_pending_response[client_fd] = _responses[client_fd].get_raw_response();
+									set_client_events(client_fd, POLLIN | POLLOUT);
+									continue;
+								}
 								start_cgi_job(client_fd, current_req, servers._servers[s_idx], *cgi_loc, uri_path, s_idx);
 								continue;
 							}
@@ -1898,7 +1923,7 @@ std::vector<std::string> tokenize(std::string& config_data)
 ServerConfig::ServerConfig() : _port(8080), _client_max_body_size(1048576)
 {}
 
-LocationConfig::LocationConfig() : _autoindex(false), _return_code(0)
+LocationConfig::LocationConfig() : _autoindex(false), _return_code(0), _client_max_body_size(0)
 {}
 
 size_t parse_size(std::string s)
@@ -2001,6 +2026,11 @@ void parse_config(std::vector<std::string> tokens, Config& final_config)
 						{
 							if (++i < tokens.size())
 								loc._cgi_path = tokens[i];
+						}
+						else if (tokens[i] == "client_max_body_size")
+						{
+							if (++i < tokens.size())
+								loc._client_max_body_size = parse_size(tokens[i]);
 						}
 						else if (tokens[i] == "cgi_extension")
 						{

@@ -37,6 +37,7 @@ public:
 	std::vector<std::string> _allowed_methods;
 	bool _autoindex;
 	int _return_code;
+	size_t _client_max_body_size;
 	std::string _return_url;
 };
 
