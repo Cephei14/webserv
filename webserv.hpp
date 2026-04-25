@@ -105,6 +105,7 @@ public:
 	const std::map<std::string, std::string>& getMap() const;
 	const std::string& getVersion() const;
 	std::string getBody() const;
+	size_t getBufferedBodySize() const;
 
 private:
 	std::string _method;

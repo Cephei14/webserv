@@ -551,6 +551,17 @@ std::string HTTPRequest::getBody() const
 	return _raw_buf.substr(body_start, _parsed_request_end - body_start);
 }
 
+size_t HTTPRequest::getBufferedBodySize() const
+{
+	size_t n = _raw_buf.find("\r\n\r\n");
+	if (n == std::string::npos)
+		return 0;
+	size_t body_start = n + 4;
+	if (_raw_buf.size() <= body_start)
+		return 0;
+	return _raw_buf.size() - body_start;
+}
+
 const std::string& HTTPRequest::getUri() const
 {
 	return(_uri);
@@ -1778,17 +1789,18 @@ void server::srv_manage(Config& servers)
 							current_req.AddRawP(buf, nbytes);
 							if (current_req.getMethod() == "POST" && !current_req.IsParsed())
 							{
+								int s_idx = resolve_server_index(client_fd, current_req, servers);
+								ServerConfig& selected_srv = servers._servers[s_idx];
+								size_t limit = selected_srv._client_max_body_size;
+								LocationConfig* matched_loc = find_best_location_for_path(selected_srv, current_req.getUri());
+								if (matched_loc != NULL && matched_loc->_client_max_body_size > 0)
+									limit = matched_loc->_client_max_body_size;
+
 								const std::map<std::string, std::string>& hdrs = current_req.getMap();
 								std::map<std::string, std::string>::const_iterator cl_it = hdrs.find("content-length");
 								if (cl_it != hdrs.end())
 								{
 									unsigned long declared_len = std::strtoul(cl_it->second.c_str(), NULL, 10);
-									int s_idx = resolve_server_index(client_fd, current_req, servers);
-									ServerConfig& selected_srv = servers._servers[s_idx];
-									size_t limit = selected_srv._client_max_body_size;
-									LocationConfig* matched_loc = find_best_location_for_path(selected_srv, current_req.getUri());
-									if (matched_loc != NULL && matched_loc->_client_max_body_size > 0)
-										limit = matched_loc->_client_max_body_size;
 									if (declared_len > limit)
 									{
 										HTTPResponse too_large_res;
@@ -1798,6 +1810,16 @@ void server::srv_manage(Config& servers)
 										_fds[i].events = POLLOUT;
 										continue;
 									}
+								}
+
+								if (current_req.getBufferedBodySize() > limit)
+								{
+									HTTPResponse too_large_res;
+									too_large_res.build_error_response(413, selected_srv);
+									_pending_response[client_fd] = too_large_res.get_raw_response();
+									_fd_keep_alive[client_fd] = false;
+									_fds[i].events = POLLOUT;
+									continue;
 								}
 							}
 						}
