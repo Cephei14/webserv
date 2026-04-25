@@ -1,0 +1,98 @@
+Defense-style checklist.
+
+1. Build and Makefile rules  
+Run: make fclean && make  
+Expect: build succeeds with no warnings/errors.  
+Run: make  
+Expect: no unnecessary relink.
+
+2. Start with config file argument  
+Run: ./webserv webserv.conf  
+Expect: server starts and stays running.
+
+3. Static website on first port  
+Run: curl -i http://127.0.0.1:8080/  
+Expect: HTTP 200 and HTML body.
+
+4. Multiple ports, different content  
+Run: curl -i http://127.0.0.1:8081/  
+Expect: HTTP 200 from second site.  
+Run: diff -q <(curl -s http://127.0.0.1:8080/) <(curl -s http://127.0.0.1:8081/)  
+Expect: files differ.
+
+5. Route redirection  
+Run: curl -i http://127.0.0.1:8080/old_site  
+Expect: HTTP 301 and Location: /
+
+6. Custom error page  
+Run: curl -s -i http://127.0.0.1:8080/does-not-exist  
+Expect: HTTP 404 and body contains 404 Custom Error Page.
+
+7. Default error page fallback  
+Run: curl -s -i -X DELETE http://127.0.0.1:8080/  
+Expect: HTTP 405.  
+Run: curl -s -X DELETE http://127.0.0.1:8080/ | grep "webserv/1.0"  
+Expect: default page marker appears (proves fallback page when no custom 405 page is set).
+
+8. Allowed methods per route  
+Run: curl -i -X DELETE http://127.0.0.1:8080/  
+Expect: 405 on root route.  
+Run: curl -i -X DELETE http://127.0.0.1:8080/uploads/somefile.txt  
+Expect: route accepts DELETE, result should be 204 or 404 depending on file existence.
+
+9. Autoindex on directory listing  
+Run: curl -s -i http://127.0.0.1:8080/errors/  
+Expect: HTTP 200 and Index of /errors/ in body.
+
+10. Upload + read + delete  
+Run: echo hello42 > /tmp/u42.txt  
+Run: curl -i -X POST --data-binary @/tmp/u42.txt http://127.0.0.1:8080/uploads/u42.txt  
+Expect: 201  
+Run: curl -i http://127.0.0.1:8080/uploads/u42.txt  
+Expect: 200 and hello42 content  
+Run: curl -i -X DELETE http://127.0.0.1:8080/uploads/u42.txt  
+Expect: 204  
+Run: curl -i http://127.0.0.1:8080/uploads/u42.txt  
+Expect: 404
+
+11. Client max body size  
+Run: dd if=/dev/zero of=/tmp/small.bin bs=1024 count=1  
+Run: dd if=/dev/zero of=/tmp/big.bin bs=1024 count=11000  
+Run: curl -i -X POST --data-binary @/tmp/small.bin http://127.0.0.1:8080/uploads/small.bin  
+Expect: 201  
+Run: curl -i -X POST --data-binary @/tmp/big.bin http://127.0.0.1:8080/uploads/big.bin  
+Expect: 413
+
+12. CGI GET and POST  
+Run: curl -s -i "http://127.0.0.1:8080/cgi-bin/test.py?x=42"  
+Expect: 200 and lines like method=GET and query=x=42.  
+Run: curl -s -i -X POST --data-binary "abcde" http://127.0.0.1:8080/cgi-bin/test.py  
+Expect: 200 and lines method=POST, len=5, body=abcde.
+
+13. CGI chunked unchunk behavior (important subject point)  
+Run: printf 'POST /cgi-bin/test.py HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n' | nc 127.0.0.1 8080  
+Expect: CGI output body=Wikipedia, not chunk markers.
+
+14. Non-hanging and resilience  
+Run: timeout 3s curl -i http://127.0.0.1:8080/  
+Expect: immediate response, not timeout.  
+Run: for i in $(seq 1 200); do curl -s http://127.0.0.1:8080/ >/dev/null & done; wait  
+Run: curl -i http://127.0.0.1:8080/  
+Expect: still 200 after burst.
+
+15. Browser compatibility  
+Open http://127.0.0.1:8080/ and http://127.0.0.1:8081/ in a browser.  
+Expect: pages render, redirect works, static files load.
+
+16. Code-level mandatory checks (for evaluator questions)  
+Run: grep -n "poll(" webserv.cpp  
+Expect: one main polling loop for socket/pipe I/O.  
+Run: grep -n "fork(" webserv.cpp  
+Expect: fork used only for CGI path.  
+Run: grep -n "execve(" webserv.cpp  
+Expect: execve appears in CGI handling only.
+
+17. README mandatory part  
+Check README.md: first line format, Description, Instructions, Resources, AI usage note.
+
+If you want, I can turn this into a one-page “defense cheat sheet” in plain language so you can rehearse speaking each test and why it satisfies the subject in en.subject.txt.

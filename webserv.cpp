@@ -906,7 +906,6 @@ int server::resolve_server_index(int client_fd, const HTTPRequest& req, const Co
 	std::map<int, int>::const_iterator c_it = _client_to_server.find(client_fd);
 	if (c_it != _client_to_server.end() && c_it->second >= 0 && static_cast<size_t>(c_it->second) < servers._servers.size())
 		default_idx = c_it->second;
-
 	int target_port = -1;
 	if (default_idx >= 0 && static_cast<size_t>(default_idx) < servers._servers.size())
 		target_port = servers._servers[default_idx]._port;
@@ -919,13 +918,11 @@ int server::resolve_server_index(int client_fd, const HTTPRequest& req, const Co
 	}
 	if (target_port < 0)
 		return 0;
-
 	std::string host_name;
 	const std::map<std::string, std::string>& headers = req.getMap();
 	std::map<std::string, std::string>::const_iterator h_it = headers.find("host");
 	if (h_it != headers.end())
 		host_name = normalize_host_header_value(h_it->second);
-
 	int first_on_port = -1;
 	for (size_t i = 0; i < servers._servers.size(); ++i)
 	{
@@ -940,7 +937,6 @@ int server::resolve_server_index(int client_fd, const HTTPRequest& req, const Co
 				return static_cast<int>(i);
 		}
 	}
-
 	if (default_idx >= 0 && static_cast<size_t>(default_idx) < servers._servers.size() && servers._servers[default_idx]._port == target_port)
 		return default_idx;
 	if (first_on_port != -1)
