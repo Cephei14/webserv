@@ -393,6 +393,16 @@ void HTTPRequest::Validate(const std::string& buf)
 		if (_headers.find("host") == _headers.end())
 			throw std::runtime_error("400 Bad Request");
 		_headersParsed = true;
+		if (_method == "POST")
+		{
+			std::map<std::string, std::string>::const_iterator cl_it = _headers.find("content-length");
+			if (cl_it != _headers.end())
+			{
+				long cl = std::atol(cl_it->second.c_str());
+				if (cl > 0)
+					_raw_buf.reserve(end_of_headers + 4 + static_cast<size_t>(cl));
+			}
+		}
 	}
 	size_t body_start = end_of_headers + 4;
 	bool has_transfer_encoding = (_headers.find("transfer-encoding") != _headers.end());
@@ -775,6 +785,26 @@ static bool decode_chunked_body_for_cgi(const std::string& raw, std::string& out
 	}
 }
 
+static bool get_request_body_size_for_limit(const HTTPRequest& req, size_t& size_out)
+{
+	const std::map<std::string, std::string>& headers = req.getMap();
+	std::map<std::string, std::string>::const_iterator te_it = headers.find("transfer-encoding");
+	if (te_it != headers.end())
+	{
+		std::string te = to_lower_copy(te_it->second);
+		if (te.find("chunked") != std::string::npos)
+		{
+			std::string decoded_body;
+			if (!decode_chunked_body_for_cgi(req.getBody(), decoded_body))
+				return false;
+			size_out = decoded_body.size();
+			return true;
+		}
+	}
+	size_out = req.getBody().size();
+	return true;
+}
+
 void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc)
 {
 	std::string path = split_uri_path_query(req.getUri()).first;
@@ -961,8 +991,15 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 		size_t limit = (best_loc && best_loc->_client_max_body_size > 0) 
 		               ? best_loc->_client_max_body_size 
 		               : srv._client_max_body_size;
+		size_t body_size = 0;
+		if (!get_request_body_size_for_limit(req, body_size))
+		{
+			_statusCode = 400;
+			build_error_response(_statusCode, srv);
+			return;
+		}
 
-		if(req.getBody().size() <= limit)
+		if(body_size <= limit)
 			prepare_POST(req, srv, *best_loc);
 		else
 		{
@@ -1152,27 +1189,30 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 				script_path = base + script_path; //absolute path
 		}
 	}
-	struct stat script_stat;
-	if (stat(script_path.c_str(), &script_stat) != 0 || S_ISDIR(script_stat.st_mode))
+	bool is_post = (req.getMethod() == "POST");
+	if (!is_post)
 	{
-		HTTPResponse err;
-		err.build_error_response(404, srv);
-		_pending_response[client_fd] = err.get_raw_response();
-		_fd_keep_alive[client_fd] = get_keep_alive(req);
-		set_client_events(client_fd, POLLIN | POLLOUT);
-		return false;
-	}
-	if (access(script_path.c_str(), R_OK) != 0)
-	{
-		HTTPResponse err;
-		err.build_error_response(403, srv);
-		_pending_response[client_fd] = err.get_raw_response();
-		_fd_keep_alive[client_fd] = get_keep_alive(req);
-		set_client_events(client_fd, POLLIN | POLLOUT);
-		return false;
+		struct stat script_stat;
+		if (stat(script_path.c_str(), &script_stat) != 0 || S_ISDIR(script_stat.st_mode))
+		{
+			HTTPResponse err;
+			err.build_error_response(404, srv);
+			_pending_response[client_fd] = err.get_raw_response();
+			_fd_keep_alive[client_fd] = get_keep_alive(req);
+			set_client_events(client_fd, POLLIN | POLLOUT);
+			return false;
+		}
+		if (access(script_path.c_str(), R_OK) != 0)
+		{
+			HTTPResponse err;
+			err.build_error_response(403, srv);
+			_pending_response[client_fd] = err.get_raw_response();
+			_fd_keep_alive[client_fd] = get_keep_alive(req);
+			set_client_events(client_fd, POLLIN | POLLOUT);
+			return false;
+		}
 	}
 	std::string request_body;
-	bool is_post = (req.getMethod() == "POST");
 	if (is_post)
 	{
 		const std::map<std::string, std::string>& headers = req.getMap();
@@ -1827,7 +1867,15 @@ void server::srv_manage(Config& servers)
 								size_t limit = (cgi_loc && cgi_loc->_client_max_body_size > 0)
 								               ? cgi_loc->_client_max_body_size
 								               : servers._servers[s_idx]._client_max_body_size;
-								if (current_req.getBody().size() > limit)
+								size_t body_size = 0;
+								if (!get_request_body_size_for_limit(current_req, body_size))
+								{
+									_responses[client_fd].build_error_response(400, servers._servers[s_idx]);
+									_pending_response[client_fd] = _responses[client_fd].get_raw_response();
+									set_client_events(client_fd, POLLIN | POLLOUT);
+									continue;
+								}
+								if (body_size > limit)
 								{
 									_responses[client_fd].build_error_response(413, servers._servers[s_idx]);
 									_pending_response[client_fd] = _responses[client_fd].get_raw_response();
