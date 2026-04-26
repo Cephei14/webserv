@@ -280,7 +280,7 @@ void server::start_listening(Config& servers)
 			std::cerr << "server failed to bind" << std::endl;
 			continue;
 		}
-		if (listen(listen_fd, 10) == -1)
+		if (listen(listen_fd, 256) == -1)
 		{
 			std::cerr << "Listen" << std::endl;
 			close(listen_fd);
@@ -805,6 +805,20 @@ static bool get_request_body_size_for_limit(const HTTPRequest& req, size_t& size
 	return true;
 }
 
+static std::string to_cgi_http_header_env_key(const std::string& header_key)
+{
+	std::string out = "HTTP_";
+	for (size_t i = 0; i < header_key.size(); ++i)
+	{
+		char c = header_key[i];
+		if (c == '-')
+			out += '_';
+		else
+			out += static_cast<char>(toupper(static_cast<unsigned char>(c)));
+	}
+	return out;
+}
+
 void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc)
 {
 	std::string path = split_uri_path_query(req.getUri()).first;
@@ -1289,6 +1303,16 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 			env_content_type = "CONTENT_TYPE=" + it->second;
 	}
 
+	std::vector<std::string> extra_http_env;
+	{
+		const std::map<std::string, std::string>& headers = req.getMap();
+		for (std::map<std::string, std::string>::const_iterator it = headers.begin(); it != headers.end(); ++it)
+		{
+			if (it->first == "content-type" || it->first == "content-length")
+				continue;
+			extra_http_env.push_back(to_cgi_http_header_env_key(it->first) + "=" + it->second);
+		}
+	}
 	std::vector<char*> envp;
 	envp.push_back(const_cast<char*>(env_method.c_str()));
 	envp.push_back(const_cast<char*>(env_gateway.c_str()));
@@ -1300,6 +1324,8 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	envp.push_back(const_cast<char*>(env_script.c_str()));
 	envp.push_back(const_cast<char*>(env_content_length.c_str()));
 	envp.push_back(const_cast<char*>(env_content_type.c_str()));
+	for (size_t i = 0; i < extra_http_env.size(); ++i)
+		envp.push_back(const_cast<char*>(extra_http_env[i].c_str()));
 	envp.push_back(NULL);
 	char* args[3];
 	std::string abs_cgi_path = loc._cgi_path;
@@ -1800,12 +1826,21 @@ void server::srv_manage(Config& servers)
 						continue;
 					char buf[BUFF_SIZE];
 					int nbytes = recv(client_fd, buf, BUFF_SIZE - 1, 0);
-					if (nbytes <= 0)
+					if (nbytes < 0)
 					{
-						if(nbytes == 0)
-							std::cout << "srv: socket " <<  client_fd << " hung up." << std::endl;
-						else
-							std::cerr << "srv: recv error on fd " <<  client_fd << std::endl;
+						if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+						{
+							_fds[i].events = POLLIN;
+							continue;
+						}
+						std::cerr << "srv: recv error on fd " <<  client_fd << std::endl;
+						close_connection(i);
+						std::cout << "srv: client disconnected. (Total clients: " << _fds.size() - 1 << ")" << std::endl;
+						continue;
+					}
+					if (nbytes == 0)
+					{
+						std::cout << "srv: socket " <<  client_fd << " hung up." << std::endl;
 						close_connection(i);
 						std::cout << "srv: client disconnected. (Total clients: " << _fds.size() - 1 << ")" << std::endl;
 						continue;
@@ -1943,10 +1978,13 @@ void server::srv_manage(Config& servers)
 				int bytes_sent = send(client_fd, p_it->second.c_str(), p_it->second.size(), 0);
 				if (bytes_sent > 0)
 					p_it->second.erase(0, static_cast<size_t>(bytes_sent));
-				else
+				else if (bytes_sent < 0)
 				{
-					close_connection(i);
-					continue;
+					if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+					{
+						close_connection(i);
+						continue;
+					}
 				}
 				if (p_it->second.empty())
 				{
