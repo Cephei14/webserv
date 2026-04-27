@@ -48,6 +48,14 @@ static std::string normalize_host_header_value(const std::string& host_value)
 	return to_lower_copy(host);
 }
 
+static std::string uri_path_without_query(const std::string& uri)
+{
+	size_t q = uri.find('?');
+	if (q == std::string::npos)
+		return uri;
+	return uri.substr(0, q);
+}
+
 static LocationConfig* find_best_location_for_path(ServerConfig& srv, const std::string& uri)
 {
 	std::string path = uri;
@@ -199,6 +207,7 @@ void HTTPRequest::reset_parse_state()
 	_method.clear();
 	_uri.clear();
 	_version.clear();
+	_body.clear();
 	_headers.clear();
 	_headersParsed = false;
 	_isParsed = false;
@@ -434,6 +443,14 @@ void HTTPRequest::Validate(const std::string& buf)
 		_parsed_request_end = body_start;
 		_isParsed = true;
 	}
+
+	if (_isParsed)
+	{
+		if (_method == "POST" && _parsed_request_end > body_start)
+			_body.assign(_raw_buf, body_start, _parsed_request_end - body_start);
+		else
+			_body.clear();
+	}
 }
 
 void HTTPRequest::AddRawP(const char* line, int nbytes)
@@ -450,7 +467,7 @@ bool HTTPRequest::IsParsed()
 
 void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc)
 {
-	std::string path = split_uri_path_query(req.getUri()).first;
+	std::string path = uri_path_without_query(req.getUri());
 
 	if (path.find("..") != std::string::npos)
 	{
@@ -552,13 +569,9 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv, const 
 	construct_response(req);
 }
 
-std::string HTTPRequest::getBody() const
+const std::string& HTTPRequest::getBody() const
 {
-	size_t n = _raw_buf.find("\r\n\r\n");
-	size_t body_start = n + 4;
-	if (n == std::string::npos || _parsed_request_end <= body_start)
-		return ("");
-	return _raw_buf.substr(body_start, _parsed_request_end - body_start);
+	return _body;
 }
 
 const std::string& HTTPRequest::getUri() const
@@ -598,19 +611,6 @@ const std::string& HTTPResponse::get_raw_response() const
 	return _final_response;
 }
 
-
-std::pair<std::string, std::string> HTTPResponse::split_uri_path_query(const std::string& uri)
-{
-	size_t q = uri.find('?');
-	if(q == std::string::npos)
-		return (std::make_pair(uri, ""));
-	else
-	{
-		std::string path = uri.substr(0,q);
-		std::string query = uri.substr(q + 1);
-		return (std::make_pair(path, query));
-	}
-}
 
 std::string HTTPResponse::get_content_type(const std::string& uri)
 {
@@ -712,8 +712,8 @@ void HTTPResponse::body_GET(const std::string& path)
 
 void HTTPResponse::handle_chunks(const HTTPRequest& req)
 {
-    std::string raw_body = req.getBody();
-    std::string decoded_body = "";
+	const std::string& raw_body = req.getBody();
+	std::string decoded_body;
     size_t pos = 0;
 
     while (pos < raw_body.length())
@@ -821,7 +821,8 @@ static std::string to_cgi_http_header_env_key(const std::string& header_key)
 
 void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc)
 {
-	std::string path = split_uri_path_query(req.getUri()).first;
+	const std::string& request_body = req.getBody();
+	std::string path = uri_path_without_query(req.getUri());
 	if (path.find("..") != std::string::npos)
 	{
 		_statusCode = 403;
@@ -847,8 +848,10 @@ void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const
 	std::map<std::string, std::string>::const_iterator it = header_req.find("content-length");
 	if (it != header_req.end()) 
 	{
-		_data_size = std::atoi(it->second.c_str());
-		_post_body = req.getBody().substr(0, _data_size);
+		_data_size = static_cast<size_t>(std::atoi(it->second.c_str()));
+		if (_data_size > request_body.size())
+			_data_size = request_body.size();
+		_post_body.assign(request_body, 0, _data_size);
 	}
 	else
 		handle_chunks(req);
@@ -858,7 +861,7 @@ void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const
 
 void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc)
 {
-	std::string path = split_uri_path_query(req.getUri()).first;
+	std::string path = uri_path_without_query(req.getUri());
 	if (path.find("..") != std::string::npos)
 	{
 		_statusCode = 403;
@@ -905,8 +908,7 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 {
 	LocationConfig* best_loc = NULL;
 	size_t best_len = 0;
-	std::pair<std::string, std::string> result = split_uri_path_query(req.getUri());
-	std::string path = result.first;
+	std::string path = uri_path_without_query(req.getUri());
 	for(size_t j = 0; j < srv._locations.size(); j++)
 	{
 		LocationConfig& loc = srv._locations[j];
@@ -1226,7 +1228,9 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 			return false;
 		}
 	}
-	std::string request_body;
+	bool use_decoded_body = false;
+	size_t request_body_size = 0;
+	std::string decoded_request_body;
 	if (is_post)
 	{
 		const std::map<std::string, std::string>& headers = req.getMap();
@@ -1240,7 +1244,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		}
 		if (is_chunked)
 		{
-			if (!decode_chunked_body_for_cgi(req.getBody(), request_body))
+			if (!decode_chunked_body_for_cgi(req.getBody(), decoded_request_body))
 			{
 				HTTPResponse err;
 				err.build_error_response(400, srv);
@@ -1249,9 +1253,11 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 				set_client_events(client_fd, POLLIN | POLLOUT);
 				return false;
 			}
+			use_decoded_body = true;
+			request_body_size = decoded_request_body.size();
 		}
 		else
-			request_body = req.getBody();
+			request_body_size = req.getBody().size();
 	}
 	int out_fd[2];
 	int in_fd[2];
@@ -1295,7 +1301,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	if (is_post)
 	{
 		std::stringstream ss;
-		ss << request_body.size();
+		ss << request_body_size;
 		env_content_length = "CONTENT_LENGTH=" + ss.str();
 		const std::map<std::string, std::string>& headers = req.getMap();
 		std::map<std::string, std::string>::const_iterator it = headers.find("content-type");
@@ -1438,13 +1444,16 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	job.pid = pid;
 	job.in_fd = is_post ? in_fd[1] : -1;
 	job.out_fd = out_fd[0];
-	job.request_body = request_body;
 	job.write_offset = 0;
+	job.request_body_size = request_body_size;
+	job.use_decoded_body = use_decoded_body;
+	if (job.use_decoded_body)
+		job.request_body.swap(decoded_request_body);
 	job.output.clear();
 	job.start_ms = now_ms();
 	job.child_done = false;
 	job.child_status = 0;
-	if (job.in_fd != -1 && job.request_body.empty()) //POST without a body
+	if (job.in_fd != -1 && job.request_body_size == 0) //POST without a body
 	{
 		close(job.in_fd);
 		job.in_fd = -1;
@@ -1585,9 +1594,27 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 		}
 		if (revents & POLLOUT)
 		{
-			if (job.write_offset < job.request_body.size())
+			const char* write_buf = NULL;
+			size_t write_size = job.request_body_size;
+			if (job.use_decoded_body)
+				write_buf = job.request_body.c_str();
+			else
 			{
-				ssize_t w = write(fd, job.request_body.c_str() + job.write_offset, job.request_body.size() - job.write_offset);
+				std::map<int, HTTPRequest>::iterator req_it = _requests.find(client_fd);
+				if (req_it == _requests.end())
+				{
+					finalize_cgi_job(client_fd, servers, false, 500);
+					return;
+				}
+				const std::string& req_body = req_it->second.getBody();
+				if (req_body.size() < write_size)
+					write_size = req_body.size();
+				write_buf = req_body.c_str();
+			}
+
+			if (job.write_offset < write_size)
+			{
+				ssize_t w = write(fd, write_buf + job.write_offset, write_size - job.write_offset);
 				if (w <= 0)
 				{
 					finalize_cgi_job(client_fd, servers, false, 500);
@@ -1595,7 +1622,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 				}
 				job.write_offset += static_cast<size_t>(w);
 			}
-			if (job.write_offset >= job.request_body.size())
+			if (job.write_offset >= write_size)
 			{
 				close(fd);
 				_cgi_in_to_client.erase(fd);
@@ -2307,8 +2334,7 @@ void ConfigManager(char **argv, Config& servers)
                 config_data.erase(h, n - h); 
             h = config_data.find("#", h);
         }
-		std::vector<std::string> tokens = tokenize(config_data);
-		parse_config(tokens, servers);
+		parse_config(tokenize(config_data), servers);
     }
     else
         throw std::runtime_error("Configuration file Error");

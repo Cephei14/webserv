@@ -78,7 +78,6 @@ public:
 	void body_POST(const std::string& path);
 	void handle_chunks(const HTTPRequest& req);
 	void build_error_response(int status_code, ServerConfig& config);
-	std::pair<std::string, std::string> split_uri_path_query(const std::string& uri);
 
 private:
 	std::string _version;
@@ -104,13 +103,14 @@ public:
 	const std::string& getUri() const;
 	const std::map<std::string, std::string>& getMap() const;
 	const std::string& getVersion() const;
-	std::string getBody() const;
+	const std::string& getBody() const;
 
 private:
 	std::string _method;
 	std::string _uri;
 	std::string _version;
 	std::string _raw_buf;
+	std::string _body;
 	std::map<std::string, std::string> _headers;
 	bool _isParsed;
 	bool _headersParsed;
@@ -128,7 +128,7 @@ private:
 	struct CgiJob
 	{
 		CgiJob()
-			: client_fd(-1), server_index(0), pid(-1), in_fd(-1), out_fd(-1), write_offset(0), start_ms(0), child_done(false), child_status(0)
+			: client_fd(-1), server_index(0), pid(-1), in_fd(-1), out_fd(-1), write_offset(0), request_body_size(0), use_decoded_body(false), start_ms(0), child_done(false), child_status(0)
 		{}
 		int client_fd;
 		int server_index;
@@ -137,6 +137,8 @@ private:
 		int out_fd;
 		std::string request_body;
 		size_t write_offset;
+		size_t request_body_size;
+		bool use_decoded_body;
 		std::string output;
 		long start_ms;
 		bool child_done;
