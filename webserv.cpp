@@ -593,7 +593,7 @@ HTTPResponse::HTTPResponse()
 	  _final_response("") 
 {}
 
-std::string HTTPResponse::get_raw_response() const
+const std::string& HTTPResponse::get_raw_response() const
 {
 	return _final_response;
 }
@@ -1887,8 +1887,7 @@ void server::srv_manage(Config& servers)
 						    HTTPResponse error_res;
 							int s_idx = resolve_server_index(client_fd, current_req, servers);
 						    error_res.build_error_response(status_code, servers._servers[s_idx]);
-						    std::string raw = error_res.get_raw_response();
-							_pending_response[client_fd] = raw;
+							_pending_response[client_fd] = error_res.get_raw_response();
 							_fd_keep_alive[client_fd] = false;
 							_fds[i].events = POLLOUT;
 						}
@@ -1922,8 +1921,7 @@ void server::srv_manage(Config& servers)
 							}
 							HTTPResponse new_response;
 							new_response.build(current_req, servers._servers[s_idx]);
-							std::string raw = new_response.get_raw_response();
-							_pending_response[client_fd] = raw;
+							_pending_response[client_fd] = new_response.get_raw_response();
 							_fd_keep_alive[client_fd] = get_keep_alive(current_req);
 							_fds[i].events = POLLIN | POLLOUT;
 						}
@@ -1959,8 +1957,7 @@ void server::srv_manage(Config& servers)
 								continue;
 							}
 							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
-							std::string raw = _responses[client_fd].get_raw_response();
-							_pending_response[client_fd] = raw;
+							_pending_response[client_fd] = _responses[client_fd].get_raw_response();
 							keep_alive = get_keep_alive(_requests[client_fd]);
 							_fd_keep_alive[client_fd] = keep_alive;
 							_fds[i].events = POLLIN | POLLOUT;
@@ -2004,8 +2001,7 @@ void server::srv_manage(Config& servers)
 								continue;
 							}
 							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
-							std::string raw = _responses[client_fd].get_raw_response();
-							_pending_response[client_fd] = raw;
+							_pending_response[client_fd] = _responses[client_fd].get_raw_response();
 							keep_alive = get_keep_alive(_requests[client_fd]);
 							_fd_keep_alive[client_fd] = keep_alive;
 							_fds[i].events = POLLIN | POLLOUT;
@@ -2071,24 +2067,35 @@ void AppManager::run(Config& servers)
 	serv.srv_manage(servers);
 }
 
-std::vector<std::string> tokenize(std::string& config_data)
+std::vector<std::string> tokenize(const std::string& config_data)
 {
 	std::vector<std::string> tokens;
-	std::string symbols = "{};";
-
+	std::string current;
 	for (size_t i = 0; i < config_data.length(); ++i)
 	{
-		if (symbols.find(config_data[i]) != std::string::npos)
+		char c = config_data[i];
+		if (c == '{' || c == '}' || c == ';')
 		{
-			config_data.insert(i, " ");
-			config_data.insert(i + 2, " ");
-			i += 2;
+			if (!current.empty())
+			{
+				tokens.push_back(current);
+				current.clear();
+			}
+			tokens.push_back(std::string(1, c));
 		}
+		else if (std::isspace(static_cast<unsigned char>(c)))
+		{
+			if (!current.empty())
+			{
+				tokens.push_back(current);
+				current.clear();
+			}
+		}
+		else
+			current += c;
 	}
-	std::stringstream ss(config_data);
-	std::string temp;
-	while (ss >> temp)
-		tokens.push_back(temp);
+	if (!current.empty())
+		tokens.push_back(current);
 	return tokens;
 }
 
@@ -2098,11 +2105,11 @@ ServerConfig::ServerConfig() : _port(8080), _client_max_body_size(1048576)
 LocationConfig::LocationConfig() : _autoindex(false), _return_code(0), _client_max_body_size(0)
 {}
 
-size_t parse_size(std::string s)
+size_t parse_size(const std::string& s)
 {
 	if (s.empty())
 		return 0;
-	char unit = toupper(s[s.length() - 1]);
+	char unit = static_cast<char>(toupper(static_cast<unsigned char>(s[s.length() - 1])));
 	size_t multiplier = 1;
 
 	if (unit == 'K')
@@ -2111,12 +2118,10 @@ size_t parse_size(std::string s)
 		multiplier = 1024 * 1024;
 	else if (unit == 'G')
 		multiplier = 1024 * 1024 * 1024;
-	if (unit == 'K' || unit == 'M' || unit == 'G')
-		s.erase(s.length() - 1);
 	return (static_cast<size_t>(std::atoll(s.c_str()) * multiplier));
 }
 
-void parse_config(std::vector<std::string> tokens, Config& final_config)
+void parse_config(const std::vector<std::string>& tokens, Config& final_config)
 {
 	for (size_t i = 0; i < tokens.size(); ++i)
 	{

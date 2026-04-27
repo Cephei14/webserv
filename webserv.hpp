@@ -73,7 +73,7 @@ public:
 	void prepare_POST(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc);
 	void prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc);
 	std::string get_content_type(const std::string& uri);
-	std::string get_raw_response() const;
+	const std::string& get_raw_response() const;
 	void body_GET(const std::string& path);
 	void body_POST(const std::string& path);
 	void handle_chunks(const HTTPRequest& req);
