@@ -145,8 +145,8 @@ private:
 		int child_status;
 	};
 
-	bool is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationConfig*& best_loc, std::string& uri_path);
-	bool start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc, const std::string& uri_path, int server_index);
+	bool is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationConfig*& script_loc, LocationConfig*& cgi_loc, std::string& uri_path);
+	bool start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& script_loc, const LocationConfig& cgi_loc, const std::string& uri_path, int server_index);
 	void process_cgi_pipe_event(size_t& i, Config& servers);
 	void finalize_cgi_job(int client_fd, Config& servers, bool success, int status_code);
 	void cleanup_cgi_job(int client_fd, bool kill_child);

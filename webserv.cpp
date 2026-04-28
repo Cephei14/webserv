@@ -1119,9 +1119,10 @@ void server::set_client_events(int client_fd, short events)
 	}
 }
 
-bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationConfig*& best_loc, std::string& uri_path)
+bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationConfig*& script_loc, LocationConfig*& cgi_loc, std::string& uri_path)
 {
-	best_loc = NULL;
+	script_loc = NULL;
+	cgi_loc = NULL;
 	uri_path = req.getUri();
 	size_t q = uri_path.find('?');
 	if (q != std::string::npos)
@@ -1137,52 +1138,48 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 		if (match_len >= best_len)
 		{
 			best_len = match_len;
-			best_loc = &loc;
+			script_loc = &loc;
 		}
 	}
-	if (best_loc == NULL)
+	if (script_loc == NULL)
 	{
 		for (size_t j = 0; j < srv._locations.size(); ++j)
 		{
 			if (srv._locations[j]._path == "/")
 			{
-				best_loc = &srv._locations[j];
+				script_loc = &srv._locations[j];
 				break;
 			}
 		}
 	}
-	if (best_loc == NULL)
+	if (script_loc == NULL)
 		return false;
-	if (best_loc->_return_code > 0 && !best_loc->_return_url.empty())
+	if (script_loc->_return_code > 0 && !script_loc->_return_url.empty())
 		return false;//manage redirect somewhere else
 	if (req.getMethod() != "GET" && req.getMethod() != "POST")
-		return false;
-	bool method_found = false;
-	for (size_t k = 0; k < best_loc->_allowed_methods.size(); ++k)
-	{
-		if (req.getMethod() == best_loc->_allowed_methods[k])
-		{
-			method_found = true;
-			break;
-		}
-	}
-	if (!method_found)
-		return false;
-	if (best_loc->_cgi_path.empty() || best_loc->_cgi_ext.empty())
 		return false;
 	size_t dot = uri_path.find_last_of('.');
 	if (dot == std::string::npos)
 		return false;
 	std::string ext = uri_path.substr(dot);
-	for (size_t k = 0; k < best_loc->_cgi_ext.size(); ++k)
+	for (size_t j = 0; j < srv._locations.size(); ++j)
 	{
-		if (best_loc->_cgi_ext[k] == ext)
-			return true;
+		LocationConfig& loc = srv._locations[j];
+		if (loc._cgi_path.empty() || loc._cgi_ext.empty())
+			continue;
+		for (size_t k = 0; k < loc._cgi_ext.size(); ++k)
+		{
+			if (loc._cgi_ext[k] == ext)
+			{
+				cgi_loc = &loc;
+				return true;
+			}
+		}
 	}
 	return false;
 }
 
-bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& loc, const std::string& uri_path, int server_index)
+bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& script_loc, const LocationConfig& cgi_loc, const std::string& uri_path, int server_index)
 {
 	if (_cgi_jobs.find(client_fd) != _cgi_jobs.end())
 		return true;
@@ -1197,10 +1194,10 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		return false;
 	}
 
-	std::string root = loc._root.empty() ? srv._root : loc._root;
+	std::string root = script_loc._root.empty() ? srv._root : script_loc._root;
 	std::string rel = uri_path;
-	size_t prefix_len = location_match_prefix_length(rel, loc._path);
-	if (prefix_len > 0 && loc._path != "/")
+	size_t prefix_len = location_match_prefix_length(rel, script_loc._path);
+	if (prefix_len > 0 && script_loc._path != "/")
 		rel = rel.substr(prefix_len);
 	if (rel.empty() || rel[0] != '/')
 		rel = "/" + rel;
@@ -1348,7 +1345,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		envp.push_back(const_cast<char*>(extra_http_env[i].c_str()));
 	envp.push_back(NULL);
 	char* args[3];
-	std::string abs_cgi_path = loc._cgi_path;
+	std::string abs_cgi_path = cgi_loc._cgi_path;
 	if (!abs_cgi_path.empty() && abs_cgi_path[0] != '/')
 	{
 		char cwd[4096];
@@ -1903,16 +1900,23 @@ void server::srv_manage(Config& servers)
 									ServerConfig& selected_srv = servers._servers[s_idx];
 									size_t limit = selected_srv._client_max_body_size;
 									LocationConfig* matched_loc = find_best_location_for_path(selected_srv, current_req.getUri());
-									if (matched_loc != NULL && matched_loc->_client_max_body_size > 0)
-										limit = matched_loc->_client_max_body_size;
-									if (declared_len > limit)
+									LocationConfig* script_loc = NULL;
+									LocationConfig* cgi_loc = NULL;
+									std::string cgi_uri_path;
+									bool is_cgi = is_cgi_request(current_req, selected_srv, script_loc, cgi_loc, cgi_uri_path);
+									if (!is_cgi)
 									{
-										HTTPResponse too_large_res;
-										too_large_res.build_error_response(413, selected_srv);
-										_pending_response[client_fd] = too_large_res.get_raw_response();
-										_fd_keep_alive[client_fd] = false;
-										_fds[i].events = POLLOUT;
-										continue;
+										if (matched_loc != NULL && matched_loc->_client_max_body_size > 0)
+											limit = matched_loc->_client_max_body_size;
+										if (declared_len > limit)
+										{
+											HTTPResponse too_large_res;
+											too_large_res.build_error_response(413, selected_srv);
+											_pending_response[client_fd] = too_large_res.get_raw_response();
+											_fd_keep_alive[client_fd] = false;
+											_fds[i].events = POLLOUT;
+											continue;
+										}
 									}
 								}
 							}
@@ -1935,13 +1939,11 @@ void server::srv_manage(Config& servers)
 						if (current_req.IsParsed() && _pending_response.find(client_fd) == _pending_response.end() && _cgi_jobs.find(client_fd) == _cgi_jobs.end())
 						{
 							int s_idx = resolve_server_index(client_fd, current_req, servers);
+							LocationConfig* script_loc = NULL;
 							LocationConfig* cgi_loc = NULL;
 							std::string uri_path;
-							if (is_cgi_request(current_req, servers._servers[s_idx], cgi_loc, uri_path))
+							if (is_cgi_request(current_req, servers._servers[s_idx], script_loc, cgi_loc, uri_path))
 							{
-								size_t limit = (cgi_loc && cgi_loc->_client_max_body_size > 0)
-								               ? cgi_loc->_client_max_body_size
-								               : servers._servers[s_idx]._client_max_body_size;
 								size_t body_size = 0;
 								if (!get_request_body_size_for_limit(current_req, body_size))
 								{
@@ -1950,14 +1952,14 @@ void server::srv_manage(Config& servers)
 									set_client_events(client_fd, POLLIN | POLLOUT);
 									continue;
 								}
-								if (body_size > limit)
+								if (cgi_loc != NULL && cgi_loc->_client_max_body_size > 0 && body_size > cgi_loc->_client_max_body_size)
 								{
 									_responses[client_fd].build_error_response(413, servers._servers[s_idx]);
 									_pending_response[client_fd] = _responses[client_fd].get_raw_response();
 									set_client_events(client_fd, POLLIN | POLLOUT);
 									continue;
 								}
-								start_cgi_job(client_fd, current_req, servers._servers[s_idx], *cgi_loc, uri_path, s_idx);
+								start_cgi_job(client_fd, current_req, servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
 								continue;
 							}
 							HTTPResponse new_response;
@@ -1990,11 +1992,12 @@ void server::srv_manage(Config& servers)
 						if(_requests[client_fd].IsParsed() == true)
 						{
 							int s_idx = resolve_server_index(client_fd, _requests[client_fd], servers);
+							LocationConfig* script_loc = NULL;
 							LocationConfig* cgi_loc = NULL;
 							std::string uri_path;
-							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], cgi_loc, uri_path))
+							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], script_loc, cgi_loc, uri_path))
 							{
-								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *cgi_loc, uri_path, s_idx);
+								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
 								continue;
 							}
 							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
@@ -2034,11 +2037,12 @@ void server::srv_manage(Config& servers)
 						if(_requests[client_fd].IsParsed() == true)
 						{
 							int s_idx = resolve_server_index(client_fd, _requests[client_fd], servers);
+							LocationConfig* script_loc = NULL;
 							LocationConfig* cgi_loc = NULL;
 							std::string uri_path;
-							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], cgi_loc, uri_path))
+							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], script_loc, cgi_loc, uri_path))
 							{
-								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *cgi_loc, uri_path, s_idx);
+								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
 								continue;
 							}
 							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
