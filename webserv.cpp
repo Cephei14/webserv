@@ -932,12 +932,6 @@ void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, con
 		_body = "";
 		_contentType = "";
 	}
-	else if (errno == EACCES || errno == EPERM)
-	{
-		_statusCode = 403;
-		_body = "<h1>403 Forbidden: Permission denied</h1>";
-		_contentType = "text/html";
-	}
 	else
 	{
 		_statusCode = 404;
@@ -1719,7 +1713,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			job.child_done = true;
 	}
 
-	if (now_ms() - job.start_ms > 60000)
+	if (now_ms() - job.start_ms > 300000)
 	{
 		finalize_cgi_job(client_fd, servers, false, 500);
 		return;
@@ -1830,8 +1824,6 @@ void server::srv_manage(Config& servers)
 			break;
 		if (poll(&_fds[0], _fds.size(), TOUT) == -1)
 		{
-			if (errno == EINTR)
-				continue;
 			std::cerr << "Poll" << std::endl;
 			continue;
 		}
@@ -1839,7 +1831,7 @@ void server::srv_manage(Config& servers)
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
 		{
-			if (now - jt->second.start_ms > 60000)
+			if (now - jt->second.start_ms > 300000)
 				timed_out_clients.push_back(jt->first);
 		}
 		for (size_t t = 0; t < timed_out_clients.size(); ++t)
