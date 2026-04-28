@@ -22,7 +22,7 @@
 #include <dirent.h>
 #include <sys/time.h>
 
-#define BUFF_SIZE 65536
+#define BUFF_SIZE 524288
 #define TOUT 10000
 
 class LocationConfig
@@ -75,8 +75,8 @@ public:
 	std::string get_content_type(const std::string& uri);
 	const std::string& get_raw_response() const;
 	void body_GET(const std::string& path);
-	void body_POST(const std::string& path);
-	void handle_chunks(const HTTPRequest& req);
+	void body_POST(const std::string& path, const std::string& body, size_t size);
+	std::string handle_chunks(const HTTPRequest& req);
 	void build_error_response(int status_code, ServerConfig& config);
 
 private:

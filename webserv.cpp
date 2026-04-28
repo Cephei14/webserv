@@ -727,7 +727,7 @@ void HTTPResponse::body_GET(const std::string& path)
 		_statusCode = 404;
 }
 
-void HTTPResponse::handle_chunks(const HTTPRequest& req)
+std::string HTTPResponse::handle_chunks(const HTTPRequest& req)
 {
 	const std::string& raw_body = req.getBody();
 	std::string decoded_body;
@@ -747,16 +747,16 @@ void HTTPResponse::handle_chunks(const HTTPRequest& req)
         pos += chunk_size + 2; 
     }
 	_data_size = decoded_body.size();
-    _post_body = decoded_body; 
+    return decoded_body;
 }
 
 
-void HTTPResponse::body_POST(const std::string& path)
+void HTTPResponse::body_POST(const std::string& path, const std::string& body, size_t size)
 {
 	std::ofstream outfile(path.c_str(), std::ios::out | std::ios::binary);
 	if(outfile.is_open())
 	{
-		outfile.write(_post_body.c_str(), _data_size);
+		outfile.write(body.c_str(), size);
 		outfile.close();
 		_statusCode = 201;
 		_body = "<h1>201 Created: File Uploaded Successfully</h1>";
@@ -869,11 +869,13 @@ void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const
 		_data_size = static_cast<size_t>(std::atoi(it->second.c_str()));
 		if (_data_size > request_body.size())
 			_data_size = request_body.size();
-		_post_body.assign(request_body, 0, _data_size);
+		body_POST(full_path, request_body, _data_size);
 	}
 	else
-		handle_chunks(req);
-	body_POST(full_path);
+	{
+		std::string decoded_body = handle_chunks(req);
+		body_POST(full_path, decoded_body, _data_size);
+	}
 	construct_response(req);
 }
 
@@ -1695,7 +1697,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			job.child_done = true;
 	}
 
-	if (now_ms() - job.start_ms > 5000)
+	if (now_ms() - job.start_ms > 60000)
 	{
 		finalize_cgi_job(client_fd, servers, false, 500);
 		return;
@@ -1815,7 +1817,7 @@ void server::srv_manage(Config& servers)
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
 		{
-			if (now - jt->second.start_ms > 5000)
+			if (now - jt->second.start_ms > 60000)
 				timed_out_clients.push_back(jt->first);
 		}
 		for (size_t t = 0; t < timed_out_clients.size(); ++t)
