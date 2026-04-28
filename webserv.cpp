@@ -1697,7 +1697,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			job.child_done = true;
 	}
 
-	if (now_ms() - job.start_ms > 60000)
+	if (now_ms() - job.start_ms > 180000)
 	{
 		finalize_cgi_job(client_fd, servers, false, 500);
 		return;
@@ -1817,7 +1817,7 @@ void server::srv_manage(Config& servers)
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
 		{
-			if (now - jt->second.start_ms > 60000)
+			if (now - jt->second.start_ms > 180000)
 				timed_out_clients.push_back(jt->first);
 		}
 		for (size_t t = 0; t < timed_out_clients.size(); ++t)
