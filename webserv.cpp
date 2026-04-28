@@ -51,32 +51,48 @@ static std::string normalize_host_header_value(const std::string& host_value)
 static std::string uri_path_without_query(const std::string& uri)
 {
 	size_t q = uri.find('?');
-	if (q == std::string::npos)
+	if (q == std::string::npos) {
 		return uri;
+	}
 	return uri.substr(0, q);
+}
+
+static size_t location_match_prefix_length(const std::string& path, const std::string& location_path)
+{
+	if (location_path.empty())
+		return 0;
+	std::string prefix = location_path;
+	if (prefix.size() > 1 && prefix[prefix.size() - 1] == '/') {
+		prefix.erase(prefix.size() - 1);
+	}
+	if (prefix.empty() || path.compare(0, prefix.size(), prefix) != 0) {
+		return 0;
+	}
+	if (path.size() > prefix.size() && prefix[prefix.size() - 1] != '/' && path[prefix.size()] != '/') {
+		return 0;
+	}
+	return prefix.size();
 }
 
 static LocationConfig* find_best_location_for_path(ServerConfig& srv, const std::string& uri)
 {
 	std::string path = uri;
 	size_t q = path.find('?');
-	if (q != std::string::npos)
+	if (q != std::string::npos) {
 		path = path.substr(0, q);
+	}
 
 	LocationConfig* best_loc = NULL;
 	size_t best_len = 0;
 	for (size_t j = 0; j < srv._locations.size(); ++j)
 	{
 		LocationConfig& loc = srv._locations[j];
-		if (loc._path.empty())
+		size_t match_len = location_match_prefix_length(path, loc._path);
+		if (match_len == 0) {
 			continue;
-		if (path.compare(0, loc._path.size(), loc._path) != 0)
-			continue;
-		if (path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && path[loc._path.size()] != '/')
-			continue;
-		if (loc._path.size() >= best_len)
-		{
-			best_len = loc._path.size();
+		}
+		if (match_len >= best_len) {
+			best_len = match_len;
 			best_loc = &loc;
 		}
 	}
@@ -479,8 +495,9 @@ void HTTPResponse::prepare_GET(const HTTPRequest& req, ServerConfig& srv, const 
 	}
 	std::string root = loc._root.empty() ? srv._root : loc._root;
 	std::string rel = path;
-	if (loc._path != "/" && rel.compare(0, loc._path.size(), loc._path) == 0)
-	    rel = rel.substr(loc._path.size());
+	size_t prefix_len = location_match_prefix_length(rel, loc._path);
+	if (prefix_len > 0 && loc._path != "/")
+	    rel = rel.substr(prefix_len);
 	if (rel.empty() || rel[0] != '/')
 	    rel = "/" + rel;
 	std::string full_path = root + rel;
@@ -833,8 +850,9 @@ void HTTPResponse::prepare_POST(const HTTPRequest& req, ServerConfig& srv, const
 	}
 	std::string root = loc._root.empty() ? srv._root : loc._root;
 	std::string rel = path;
-	if (loc._path != "/" && rel.compare(0, loc._path.size(), loc._path) == 0)
-    	rel = rel.substr(loc._path.size());
+	size_t prefix_len = location_match_prefix_length(rel, loc._path);
+	if (prefix_len > 0 && loc._path != "/")
+	    rel = rel.substr(prefix_len);
 	if (rel.empty() || rel[0] != '/')
 		rel = "/" + rel;
 	std::string full_path = root + rel;
@@ -872,8 +890,9 @@ void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, con
 	}
 	std::string root = loc._root.empty() ? srv._root : loc._root;
 	std::string rel = path;
-	if (loc._path != "/" && rel.compare(0, loc._path.size(), loc._path) == 0)
-	    rel = rel.substr(loc._path.size());
+	size_t prefix_len = location_match_prefix_length(rel, loc._path);
+	if (prefix_len > 0 && loc._path != "/")
+	    rel = rel.substr(prefix_len);
 	if (rel.empty() || rel[0] != '/')
 	    rel = "/" + rel;
 	std::string full_path = root + rel;
@@ -912,15 +931,12 @@ void HTTPResponse::build(const HTTPRequest& req, ServerConfig& srv)
 	for(size_t j = 0; j < srv._locations.size(); j++)
 	{
 		LocationConfig& loc = srv._locations[j];
-		if (loc._path.empty())
+		size_t match_len = location_match_prefix_length(path, loc._path);
+		if (match_len == 0)
 			continue;
-		if (path.compare(0, loc._path.size(), loc._path) != 0)
-			continue;
-		if (path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && path[loc._path.size()] != '/')
-			continue;
-		if (loc._path.size() >= best_len)
+		if (match_len >= best_len)
 		{
-			best_len = loc._path.size();
+			best_len = match_len;
 			best_loc = &loc;
 		}
 	}
@@ -1115,15 +1131,12 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 	for (size_t j = 0; j < srv._locations.size(); ++j)
 	{
 		LocationConfig& loc = srv._locations[j];
-		if (loc._path.empty())
+		size_t match_len = location_match_prefix_length(uri_path, loc._path);
+		if (match_len == 0)
 			continue;
-		if (uri_path.compare(0, loc._path.size(), loc._path) != 0) //uri:abcd/ loc:abc/
-			continue;
-		if (uri_path.size() > loc._path.size() && loc._path[loc._path.size() - 1] != '/' && uri_path[loc._path.size()] != '/') //directory?
-			continue;
-		if (loc._path.size() >= best_len)
+		if (match_len >= best_len)
 		{
-			best_len = loc._path.size();
+			best_len = match_len;
 			best_loc = &loc;
 		}
 	}
@@ -1186,8 +1199,9 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 
 	std::string root = loc._root.empty() ? srv._root : loc._root;
 	std::string rel = uri_path;
-	if (loc._path != "/" && rel.compare(0, loc._path.size(), loc._path) == 0)
-		rel = rel.substr(loc._path.size());
+	size_t prefix_len = location_match_prefix_length(rel, loc._path);
+	if (prefix_len > 0 && loc._path != "/")
+		rel = rel.substr(prefix_len);
 	if (rel.empty() || rel[0] != '/')
 		rel = "/" + rel;
 	std::string script_path = root + rel;
