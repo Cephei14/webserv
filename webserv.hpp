@@ -23,7 +23,7 @@
 #include <sys/time.h>
 
 #define BUFF_SIZE 65536
-#define TOUT 1000
+#define TOUT 10000
 
 class LocationConfig
 {
