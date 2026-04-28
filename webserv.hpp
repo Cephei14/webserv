@@ -99,6 +99,7 @@ public:
 	void Validate(const std::string& line);
 	void consume_parsed_request();
 	void reset_parse_state();
+	void clearBody();
 	const std::string& getMethod() const;
 	const std::string& getUri() const;
 	const std::map<std::string, std::string>& getMap() const;

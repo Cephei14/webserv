@@ -13,12 +13,29 @@ static long now_ms()
 	return static_cast<long>(tv.tv_sec) * 1000L + static_cast<long>(tv.tv_usec / 1000L);
 }
 
+static bool reap_child_blocking(pid_t pid)
+{
+	for (int attempt = 0; attempt < 3; ++attempt)
+	{
+		if (waitpid(pid, NULL, 0) == pid)
+			return true;
+	}
+	return false;
+}
+
 static std::string to_lower_copy(const std::string& s)
 {
 	std::string out = s;
 	for (size_t i = 0; i < out.size(); ++i)
 		out[i] = static_cast<char>(tolower(out[i]));
 	return out;
+}
+
+static void log_post_upload_success(int client_fd, const HTTPRequest& req, const std::string& raw_response)
+{
+	if (req.getMethod() == "POST" &&
+		(raw_response.find("HTTP/1.1 200 ") == 0 || raw_response.find("HTTP/1.1 201 ") == 0))
+		std::cout << "client fd " << client_fd << " uploaded successfully" << std::endl;
 }
 
 static std::string trim_copy(const std::string& s)
@@ -228,6 +245,11 @@ void HTTPRequest::reset_parse_state()
 	_headersParsed = false;
 	_isParsed = false;
 	 _parsed_request_end = 0;
+}
+
+void HTTPRequest::clearBody()
+{
+	_body.clear();
 }
 
 void HTTPRequest::consume_parsed_request()
@@ -1430,7 +1452,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		if (is_post)
 			close(in_fd[1]);
 		kill(pid, SIGKILL);
-		waitpid(pid, NULL, 0);
+		reap_child_blocking(pid);
 		HTTPResponse err;
 		err.build_error_response(500, srv);
 		_pending_response[client_fd] = err.get_raw_response();
@@ -1443,7 +1465,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		close(out_fd[0]);
 		close(in_fd[1]);
 		kill(pid, SIGKILL);
-		waitpid(pid, NULL, 0);
+		reap_child_blocking(pid);
 		HTTPResponse err;
 		err.build_error_response(500, srv);
 		_pending_response[client_fd] = err.get_raw_response();
@@ -1501,8 +1523,7 @@ void server::cleanup_cgi_job(int client_fd, bool kill_child)
 	if (kill_child && job.pid > 0 && !job.child_done)
 	{
 		kill(job.pid, SIGKILL);
-		waitpid(job.pid, NULL, 0);
-		job.child_done = true;
+		job.child_done = reap_child_blocking(job.pid);
 	}
 
 	int fds_to_disable[2];
@@ -1555,6 +1576,7 @@ void server::finalize_cgi_job(int client_fd, Config& servers, bool success, int 
 		std::string final_body;
 		parse_cgi_output_block(job.output, final_status, final_content_type, final_body);
 		build_raw_http_response(req_it->second, final_status, final_content_type, final_body, keep_alive, raw);
+		log_post_upload_success(client_fd, req_it->second, raw);
 	}
 	else
 	{
@@ -1697,7 +1719,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			job.child_done = true;
 	}
 
-	if (now_ms() - job.start_ms > 180000)
+	if (now_ms() - job.start_ms > 60000)
 	{
 		finalize_cgi_job(client_fd, servers, false, 500);
 		return;
@@ -1805,7 +1827,7 @@ void server::srv_manage(Config& servers)
 	while(!signaled)
 	{
 		if (_fds.empty())
-			continue;
+			break;
 		if (poll(&_fds[0], _fds.size(), TOUT) == -1)
 		{
 			if (errno == EINTR)
@@ -1817,7 +1839,7 @@ void server::srv_manage(Config& servers)
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
 		{
-			if (now - jt->second.start_ms > 180000)
+			if (now - jt->second.start_ms > 60000)
 				timed_out_clients.push_back(jt->first);
 		}
 		for (size_t t = 0; t < timed_out_clients.size(); ++t)
@@ -1957,11 +1979,13 @@ void server::srv_manage(Config& servers)
 									continue;
 								}
 								start_cgi_job(client_fd, current_req, servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
+								current_req.clearBody();
 								continue;
 							}
 							HTTPResponse new_response;
 							new_response.build(current_req, servers._servers[s_idx]);
 							_pending_response[client_fd] = new_response.get_raw_response();
+							log_post_upload_success(client_fd, current_req, _pending_response[client_fd]);
 							_fd_keep_alive[client_fd] = get_keep_alive(current_req);
 							_fds[i].events = POLLIN | POLLOUT;
 						}
@@ -1995,10 +2019,12 @@ void server::srv_manage(Config& servers)
 							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], script_loc, cgi_loc, uri_path))
 							{
 								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
+								_requests[client_fd].clearBody();
 								continue;
 							}
 							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
 							_pending_response[client_fd] = _responses[client_fd].get_raw_response();
+							log_post_upload_success(client_fd, _requests[client_fd], _pending_response[client_fd]);
 							keep_alive = get_keep_alive(_requests[client_fd]);
 							_fd_keep_alive[client_fd] = keep_alive;
 							_fds[i].events = POLLIN | POLLOUT;
@@ -2037,10 +2063,12 @@ void server::srv_manage(Config& servers)
 							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], script_loc, cgi_loc, uri_path))
 							{
 								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
+								_requests[client_fd].clearBody();
 								continue;
 							}
 							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
 							_pending_response[client_fd] = _responses[client_fd].get_raw_response();
+							log_post_upload_success(client_fd, _requests[client_fd], _pending_response[client_fd]);
 							keep_alive = get_keep_alive(_requests[client_fd]);
 							_fd_keep_alive[client_fd] = keep_alive;
 							_fds[i].events = POLLIN | POLLOUT;
@@ -2063,6 +2091,11 @@ void server::srv_manage(Config& servers)
 			else
 				++k;
 		}
+	}
+	for (std::map<int, CgiJob>::iterator it = _cgi_jobs.begin(); it != _cgi_jobs.end(); ++it)
+	{
+		kill(it->second.pid, SIGKILL);
+		reap_child_blocking(it->second.pid);
 	}
 	for(size_t i = 0; i < _fds.size(); i++)
 	{
@@ -2314,7 +2347,7 @@ void parse_config(const std::vector<std::string>& tokens, Config& final_config)
 				}
 			}
 			if (serv._host.empty())
-				serv._host = "0.0.0.0";
+				serv._host = "127.0.0.1";
 			final_config._servers.push_back(serv);
 		}
 	}
