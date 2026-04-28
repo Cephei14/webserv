@@ -1866,12 +1866,7 @@ void server::srv_manage(Config& servers)
 					int nbytes = recv(client_fd, buf, BUFF_SIZE - 1, 0);
 					if (nbytes < 0)
 					{
-						if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-						{
-							_fds[i].events = POLLIN;
-							continue;
-						}
-						std::cerr << "srv: recv error on fd " <<  client_fd << std::endl;
+						std::cerr << "srv: recv error (hard failure) on fd " <<  client_fd << std::endl;
 						close_connection(i);
 						std::cout << "srv: client disconnected. (Total clients: " << _fds.size() - 1 << ")" << std::endl;
 						continue;
@@ -2021,11 +2016,8 @@ void server::srv_manage(Config& servers)
 					p_it->second.erase(0, static_cast<size_t>(bytes_sent));
 				else if (bytes_sent < 0)
 				{
-					if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-					{
-						close_connection(i);
-						continue;
-					}
+					close_connection(i);
+					continue;
 				}
 				if (p_it->second.empty())
 				{
