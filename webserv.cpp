@@ -2314,7 +2314,7 @@ void parse_config(const std::vector<std::string>& tokens, Config& final_config)
 				}
 			}
 			if (serv._host.empty())
-				serv._host = "127.0.0.1";
+				serv._host = "0.0.0.0";
 			final_config._servers.push_back(serv);
 		}
 	}
