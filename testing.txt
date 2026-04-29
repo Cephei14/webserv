@@ -1,5 +1,10 @@
 Defense-style checklist.
 
+Note: It is recommended to run these tests inside the .venv 
+if using the automated python test scripts.
+This ensures the 'requests' library is available for tests and 
+CGI scripts inherit the correct environment.
+
 1. Build and Makefile rules  
 Run: make fclean && make  
 Expect: build succeeds with no warnings/errors.  
