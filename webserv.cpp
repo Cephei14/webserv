@@ -1174,7 +1174,7 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 		return false;
 	if (script_loc->_return_code > 0 && !script_loc->_return_url.empty())
 		return false;//manage redirect somewhere else
-	if (req.getMethod() != "POST")
+	if (req.getMethod() != "GET" && req.getMethod() != "POST")
 		return false;
 	size_t dot = uri_path.find_last_of('.');
 	if (dot == std::string::npos)
@@ -1189,11 +1189,8 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 		{
 			if (loc._cgi_ext[k] == ext)
 			{
-				if (location_match_prefix_length(uri_path, loc._path) > 0)
-				{
-					cgi_loc = &loc;
-					return true;
-				}
+				cgi_loc = &loc;
+				return true;
 			}
 		}
 	}
