@@ -1189,8 +1189,11 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 		{
 			if (loc._cgi_ext[k] == ext)
 			{
-				cgi_loc = &loc;
-				return true;
+				if (location_match_prefix_length(uri_path, loc._path) > 0)
+				{
+					cgi_loc = &loc;
+					return true;
+				}
 			}
 		}
 	}
