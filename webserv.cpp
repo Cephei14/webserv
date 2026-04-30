@@ -2135,15 +2135,12 @@ void AppManager::signal_handler(int s)
 
 void AppManager::run(Config& servers)
 {
-	struct sigaction sa;
-	sa.sa_handler = signal_handler;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags=0;
-	if (sigaction(SIGTERM, &sa, NULL) == -1)
-		throw std::runtime_error("SIGACTION FAILED");
-	signal(SIGPIPE, SIG_IGN);
-	if (sigaction(SIGINT, &sa, NULL) == -1)
-		throw std::runtime_error("SIGACTION FAILED");
+	if (signal(SIGTERM, signal_handler) == SIG_ERR)
+		throw std::runtime_error("SIGNAL FAILED");
+	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+		throw std::runtime_error("SIGNAL FAILED");
+	if (signal(SIGINT, signal_handler) == SIG_ERR)
+		throw std::runtime_error("SIGNAL FAILED");
 	server serv;
 	serv.start_listening(servers);
 	serv.srv_manage(servers);
