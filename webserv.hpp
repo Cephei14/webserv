@@ -23,7 +23,7 @@
 #include <sys/time.h>
 
 #define BUFF_SIZE 524288
-#define TOUT 10000
+#define TOUT 500
 
 class LocationConfig
 {
@@ -142,6 +142,7 @@ private:
 		bool use_decoded_body;
 		std::string output;
 		long start_ms;
+		long last_activity_ms; 
 		bool child_done;
 		int child_status;
 	};

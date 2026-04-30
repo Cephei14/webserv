@@ -15,12 +15,8 @@ static long now_ms()
 
 static bool reap_child_blocking(pid_t pid)
 {
-	for (int attempt = 0; attempt < 3; ++attempt)
-	{
-		if (waitpid(pid, NULL, 0) == pid)
-			return true;
-	}
-	return false;
+	// After SIGKILL the child exits nearly immediately; one blocking wait is fine.
+	return (waitpid(pid, NULL, 0) == pid);
 }
 
 static std::string to_lower_copy(const std::string& s)
@@ -932,12 +928,6 @@ void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, con
 		_body = "";
 		_contentType = "";
 	}
-	else if (errno == EACCES || errno == EPERM)
-	{
-		_statusCode = 403;
-		_body = "<h1>403 Forbidden: Permission denied</h1>";
-		_contentType = "text/html";
-	}
 	else
 	{
 		_statusCode = 404;
@@ -1486,6 +1476,7 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 		job.request_body.swap(decoded_request_body);
 	job.output.clear();
 	job.start_ms = now_ms();
+	job.last_activity_ms = job.start_ms;
 	job.child_done = false;
 	job.child_status = 0;
 	if (job.in_fd != -1 && job.request_body_size == 0) //POST without a body
@@ -1651,11 +1642,9 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			{
 				ssize_t w = write(fd, write_buf + job.write_offset, write_size - job.write_offset);
 				if (w <= 0)
-				{
-					finalize_cgi_job(client_fd, servers, false, 500);
 					return;
-				}
 				job.write_offset += static_cast<size_t>(w);
+				job.last_activity_ms = now_ms(); 
 			}
 			if (job.write_offset >= write_size)
 			{
@@ -1675,7 +1664,10 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			char buffer[BUFF_SIZE];
 			ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
 			if (bytes_read > 0)
+			{
 				job.output.append(buffer, static_cast<size_t>(bytes_read));
+				job.last_activity_ms = now_ms();
+			}
 			else if (bytes_read == 0)
 			{
 				close(fd);
@@ -1719,7 +1711,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 			job.child_done = true;
 	}
 
-	if (now_ms() - job.start_ms > 300000)
+	if (now_ms() - job.last_activity_ms > 30000) 
 	{
 		finalize_cgi_job(client_fd, servers, false, 500);
 		return;
@@ -1829,21 +1821,38 @@ void server::srv_manage(Config& servers)
 		if (_fds.empty())
 			break;
 		if (poll(&_fds[0], _fds.size(), TOUT) == -1)
-		{
-			if (errno == EINTR)
-				continue;
-			std::cerr << "Poll" << std::endl;
 			continue;
-		}
 		std::vector<int> timed_out_clients;
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
 		{
-			if (now - jt->second.start_ms > 300000)
+			if (now - jt->second.last_activity_ms > 30000)
 				timed_out_clients.push_back(jt->first);
 		}
 		for (size_t t = 0; t < timed_out_clients.size(); ++t)
 			finalize_cgi_job(timed_out_clients[t], servers, false, 500);
+
+		std::vector<int> orphaned;
+		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
+		{
+			CgiJob& job = jt->second;
+			if (job.in_fd == -1 && job.out_fd == -1 && !job.child_done)
+			{
+				pid_t w = waitpid(job.pid, &job.child_status, WNOHANG);
+				if (w == job.pid)
+				{
+					job.child_done = true;
+					orphaned.push_back(jt->first);
+				}
+			}
+		}
+		for (size_t t = 0; t < orphaned.size(); ++t)
+		{
+			int cfd = orphaned[t];
+			bool ok = (WIFEXITED(_cgi_jobs[cfd].child_status) && WEXITSTATUS(_cgi_jobs[cfd].child_status) == 0);
+			finalize_cgi_job(cfd, servers, ok, 500);
+		}
+
 		size_t i = 0;
 		for(i = 0; i < _fds.size(); i++)
 		{
@@ -1851,7 +1860,8 @@ void server::srv_manage(Config& servers)
 				continue;
 			if (_cgi_in_to_client.find(_fds[i].fd) != _cgi_in_to_client.end() || _cgi_out_to_client.find(_fds[i].fd) != _cgi_out_to_client.end()) //pipe
 			{
-				process_cgi_pipe_event(i, servers);
+				if (_fds[i].revents != 0)
+					process_cgi_pipe_event(i, servers);
 				continue;
 			}
 			if (_fds[i].revents & POLLIN) //client
