@@ -4,6 +4,7 @@ static volatile sig_atomic_t signaled = 0;
 static const size_t MAX_REQUEST_LINE_BYTES = 8192;
 static const size_t MAX_URI_BYTES = 8192;
 static const size_t MAX_HEADER_BLOCK_BYTES = 65536;
+static const size_t MAX_CONCURRENT_UPLOADS = 3;
 
 static long now_ms()
 {
@@ -236,7 +237,7 @@ void HTTPRequest::reset_parse_state()
 	_method.clear();
 	_uri.clear();
 	_version.clear();
-	_body.clear();
+	std::string().swap(_body);
 	_headers.clear();
 	_headersParsed = false;
 	_isParsed = false;
@@ -245,13 +246,21 @@ void HTTPRequest::reset_parse_state()
 
 void HTTPRequest::clearBody()
 {
-	_body.clear();
+	std::string().swap(_body);
+}
+
+void HTTPRequest::takeBody(std::string& out)
+{
+	out.clear();
+	out.swap(_body);
 }
 
 void HTTPRequest::consume_parsed_request()
 {
-	_raw_buf.erase(0, _parsed_request_end);
+	std::string remaining;
+	remaining.swap(_raw_buf);
 	reset_parse_state();
+	_raw_buf.swap(remaining);
 	if(!_raw_buf.empty())
 		Validate(_raw_buf);
 }
@@ -263,6 +272,77 @@ void *get_addr_type(struct sockaddr *the_addr)
 		return &((reinterpret_cast<struct sockaddr_in*>(the_addr))->sin_addr);
 	}
 	return &((reinterpret_cast<struct sockaddr_in6*>(the_addr))->sin6_addr);
+}
+
+server::server() : _active_upload_count(0)
+{}
+
+bool server::can_read_upload_body(int client_fd, const HTTPRequest& req)
+{
+	if (req.getMethod() != "POST")
+		return true;
+	const std::map<std::string, std::string>& hdrs = req.getMap();
+	if (hdrs.empty())
+		return true;
+	std::map<int, bool>::iterator in_prog_it = _upload_in_progress.find(client_fd);
+	if (in_prog_it != _upload_in_progress.end() && in_prog_it->second)
+		return true;
+	if (_upload_waiting.find(client_fd) != _upload_waiting.end())
+	{
+		set_client_events(client_fd, 0);
+		return false;
+	}
+	if (!_upload_waiting.empty())
+	{
+		_upload_waiting[client_fd] = true;
+		_upload_waiting_order.push_back(client_fd);
+		set_client_events(client_fd, 0);
+		resume_one_waiting_upload();
+		return false;
+	}
+	if (_active_upload_count < MAX_CONCURRENT_UPLOADS)
+	{
+		_upload_in_progress[client_fd] = true;
+		_upload_waiting.erase(client_fd);
+		++_active_upload_count;
+		return true;
+	}
+	_upload_waiting[client_fd] = true;
+	_upload_waiting_order.push_back(client_fd);
+	set_client_events(client_fd, 0);
+	return false;
+}
+
+void server::release_upload_slot(int client_fd)
+{
+	std::map<int, bool>::iterator in_prog_it = _upload_in_progress.find(client_fd);
+	if (in_prog_it != _upload_in_progress.end() && in_prog_it->second)
+	{
+		_upload_in_progress.erase(in_prog_it);
+		if (_active_upload_count > 0)
+			--_active_upload_count;
+	}
+	_upload_waiting.erase(client_fd);
+	resume_one_waiting_upload();
+}
+
+void server::resume_one_waiting_upload()
+{
+	if (_active_upload_count >= MAX_CONCURRENT_UPLOADS)
+		return;
+	while (!_upload_waiting_order.empty())
+	{
+		int fd = _upload_waiting_order.front();
+		_upload_waiting_order.pop_front();
+		std::map<int, bool>::iterator it = _upload_waiting.find(fd);
+		if (it == _upload_waiting.end())
+			continue;
+		_upload_in_progress[fd] = true;
+		_upload_waiting.erase(it);
+		++_active_upload_count;
+		set_client_events(fd, POLLIN | POLLOUT);
+		break;
+	}
 }
 
 void server::start_listening(Config& servers)
@@ -436,16 +516,6 @@ void HTTPRequest::Validate(const std::string& buf)
 		if (_headers.find("host") == _headers.end())
 			throw std::runtime_error("400 Bad Request");
 		_headersParsed = true;
-		if (_method == "POST")
-		{
-			std::map<std::string, std::string>::const_iterator cl_it = _headers.find("content-length");
-			if (cl_it != _headers.end())
-			{
-				long cl = std::atol(cl_it->second.c_str());
-				if (cl > 0)
-					_raw_buf.reserve(end_of_headers + 4 + static_cast<size_t>(cl));
-			}
-		}
 	}
 	size_t body_start = end_of_headers + 4;
 	bool has_transfer_encoding = (_headers.find("transfer-encoding") != _headers.end());
@@ -481,9 +551,21 @@ void HTTPRequest::Validate(const std::string& buf)
 	if (_isParsed)
 	{
 		if (_method == "POST" && _parsed_request_end > body_start)
+		{
 			_body.assign(_raw_buf, body_start, _parsed_request_end - body_start);
+			_raw_buf.erase(0, _parsed_request_end);
+			std::string compact(_raw_buf);
+			_raw_buf.swap(compact);
+			_parsed_request_end = 0;
+		}
 		else
+		{
 			_body.clear();
+			_raw_buf.erase(0, _parsed_request_end);
+			std::string compact(_raw_buf);
+			_raw_buf.swap(compact);
+			_parsed_request_end = 0;
+		}
 	}
 }
 
@@ -494,7 +576,7 @@ void HTTPRequest::AddRawP(const char* line, int nbytes)
 		Validate(_raw_buf);
 }
 
-bool HTTPRequest::IsParsed()
+bool HTTPRequest::IsParsed() const
 {
 	return(_isParsed);
 }
@@ -1193,7 +1275,7 @@ bool server::is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationC
 	return false;
 }
 
-bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& script_loc, const LocationConfig& cgi_loc, const std::string& uri_path, int server_index)
+bool server::start_cgi_job(int client_fd, HTTPRequest& req, ServerConfig& srv, const LocationConfig& script_loc, const LocationConfig& cgi_loc, const std::string& uri_path, int server_index)
 {
 	if (_cgi_jobs.find(client_fd) != _cgi_jobs.end())
 		return true;
@@ -1474,6 +1556,8 @@ bool server::start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& 
 	job.use_decoded_body = use_decoded_body;
 	if (job.use_decoded_body)
 		job.request_body.swap(decoded_request_body);
+	else if (is_post && job.request_body_size > 0)
+		req.takeBody(job.request_body);
 	job.output.clear();
 	job.start_ms = now_ms();
 	job.last_activity_ms = job.start_ms;
@@ -1582,6 +1666,56 @@ void server::finalize_cgi_job(int client_fd, Config& servers, bool success, int 
 
 	cleanup_cgi_job(client_fd, !job.child_done);
 	_cgi_jobs.erase(client_fd);
+	release_upload_slot(client_fd);
+}
+
+bool server::process_parsed_request(int client_fd, Config& servers)
+{
+	std::map<int, HTTPRequest>::iterator req_it = _requests.find(client_fd);
+	if (req_it == _requests.end() || !req_it->second.IsParsed())
+		return false;
+	if (_pending_response.find(client_fd) != _pending_response.end() || _cgi_jobs.find(client_fd) != _cgi_jobs.end())
+		return false;
+	if (!can_read_upload_body(client_fd, req_it->second))
+		return true;
+
+	int s_idx = resolve_server_index(client_fd, req_it->second, servers);
+	LocationConfig* script_loc = NULL;
+	LocationConfig* cgi_loc = NULL;
+	std::string uri_path;
+	if (is_cgi_request(req_it->second, servers._servers[s_idx], script_loc, cgi_loc, uri_path))
+	{
+		size_t body_size = 0;
+		if (!get_request_body_size_for_limit(req_it->second, body_size))
+		{
+			release_upload_slot(client_fd);
+			_responses[client_fd].build_error_response(400, servers._servers[s_idx]);
+			_pending_response[client_fd] = _responses[client_fd].get_raw_response();
+			set_client_events(client_fd, POLLIN | POLLOUT);
+			return true;
+		}
+		if (cgi_loc != NULL && cgi_loc->_client_max_body_size > 0 && body_size > cgi_loc->_client_max_body_size)
+		{
+			release_upload_slot(client_fd);
+			_responses[client_fd].build_error_response(413, servers._servers[s_idx]);
+			_pending_response[client_fd] = _responses[client_fd].get_raw_response();
+			set_client_events(client_fd, POLLIN | POLLOUT);
+			return true;
+		}
+		if (!start_cgi_job(client_fd, req_it->second, servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx))
+			release_upload_slot(client_fd);
+		req_it->second.clearBody();
+		return true;
+	}
+
+	release_upload_slot(client_fd);
+	HTTPResponse new_response;
+	new_response.build(req_it->second, servers._servers[s_idx]);
+	_pending_response[client_fd] = new_response.get_raw_response();
+	log_post_upload_success(client_fd, req_it->second, _pending_response[client_fd]);
+	_fd_keep_alive[client_fd] = get_keep_alive(req_it->second);
+	set_client_events(client_fd, POLLIN | POLLOUT);
+	return true;
 }
 
 void server::process_cgi_pipe_event(size_t& i, Config& servers)
@@ -1620,23 +1754,8 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 		}
 		if (revents & POLLOUT)
 		{
-			const char* write_buf = NULL;
+			const char* write_buf = job.request_body.c_str();
 			size_t write_size = job.request_body_size;
-			if (job.use_decoded_body)
-				write_buf = job.request_body.c_str();
-			else
-			{
-				std::map<int, HTTPRequest>::iterator req_it = _requests.find(client_fd);
-				if (req_it == _requests.end())
-				{
-					finalize_cgi_job(client_fd, servers, false, 500);
-					return;
-				}
-				const std::string& req_body = req_it->second.getBody();
-				if (req_body.size() < write_size)
-					write_size = req_body.size();
-				write_buf = req_body.c_str();
-			}
 
 			if (job.write_offset < write_size)
 			{
@@ -1661,7 +1780,7 @@ void server::process_cgi_pipe_event(size_t& i, Config& servers)
 	{
 		if (revents & POLLIN)
 		{
-			char buffer[BUFF_SIZE];
+			static char buffer[BUFF_SIZE];
 			ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
 			if (bytes_read > 0)
 			{
@@ -1738,6 +1857,7 @@ void server::close_connection(size_t& i)
 		cleanup_cgi_job(fd, true);
 		_cgi_jobs.erase(fd);
 	}
+	release_upload_slot(fd);
 
 	close(fd);
 	_requests.erase(fd);
@@ -1896,7 +2016,7 @@ void server::srv_manage(Config& servers)
 				{
 					if (_cgi_jobs.find(client_fd) != _cgi_jobs.end())
 						continue;
-					char buf[BUFF_SIZE];
+					static char buf[BUFF_SIZE];
 					int nbytes = recv(client_fd, buf, BUFF_SIZE - 1, 0);
 					if (nbytes < 0)
 					{
@@ -1918,6 +2038,8 @@ void server::srv_manage(Config& servers)
 						try
 						{
 							current_req.AddRawP(buf, nbytes);
+							if (!can_read_upload_body(client_fd, current_req))
+								continue;
 							if (current_req.getMethod() == "POST" && !current_req.IsParsed())
 							{
 								const std::map<std::string, std::string>& hdrs = current_req.getMap();
@@ -1939,6 +2061,7 @@ void server::srv_manage(Config& servers)
 											limit = matched_loc->_client_max_body_size;
 										if (declared_len > limit)
 										{
+											release_upload_slot(client_fd);
 											HTTPResponse too_large_res;
 											too_large_res.build_error_response(413, selected_srv);
 											_pending_response[client_fd] = too_large_res.get_raw_response();
@@ -1952,6 +2075,7 @@ void server::srv_manage(Config& servers)
 						}
 						catch(const std::exception& e)
 						{
+							release_upload_slot(client_fd);
 						    int status_code = std::atoi(e.what()); 
 						
 						    if (status_code < 400 || status_code > 599)
@@ -1965,40 +2089,8 @@ void server::srv_manage(Config& servers)
 							_fd_keep_alive[client_fd] = false;
 							_fds[i].events = POLLOUT;
 						}
-						if (current_req.IsParsed() && _pending_response.find(client_fd) == _pending_response.end() && _cgi_jobs.find(client_fd) == _cgi_jobs.end())
-						{
-							int s_idx = resolve_server_index(client_fd, current_req, servers);
-							LocationConfig* script_loc = NULL;
-							LocationConfig* cgi_loc = NULL;
-							std::string uri_path;
-							if (is_cgi_request(current_req, servers._servers[s_idx], script_loc, cgi_loc, uri_path))
-							{
-								size_t body_size = 0;
-								if (!get_request_body_size_for_limit(current_req, body_size))
-								{
-									_responses[client_fd].build_error_response(400, servers._servers[s_idx]);
-									_pending_response[client_fd] = _responses[client_fd].get_raw_response();
-									set_client_events(client_fd, POLLIN | POLLOUT);
-									continue;
-								}
-								if (cgi_loc != NULL && cgi_loc->_client_max_body_size > 0 && body_size > cgi_loc->_client_max_body_size)
-								{
-									_responses[client_fd].build_error_response(413, servers._servers[s_idx]);
-									_pending_response[client_fd] = _responses[client_fd].get_raw_response();
-									set_client_events(client_fd, POLLIN | POLLOUT);
-									continue;
-								}
-								start_cgi_job(client_fd, current_req, servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
-								current_req.clearBody();
+							if (process_parsed_request(client_fd, servers))
 								continue;
-							}
-							HTTPResponse new_response;
-							new_response.build(current_req, servers._servers[s_idx]);
-							_pending_response[client_fd] = new_response.get_raw_response();
-							log_post_upload_success(client_fd, current_req, _pending_response[client_fd]);
-							_fd_keep_alive[client_fd] = get_keep_alive(current_req);
-							_fds[i].events = POLLIN | POLLOUT;
-						}
 					}
 				}
 			}
@@ -2007,41 +2099,23 @@ void server::srv_manage(Config& servers)
 				int client_fd = _fds[i].fd;
 				std::map<int, std::string>::iterator p_it = _pending_response.find(client_fd);
 				std::map<int, bool>::iterator k_it = _fd_keep_alive.find(client_fd);
-				bool keep_alive = (k_it != _fd_keep_alive.end() && k_it->second);
-				if (p_it == _pending_response.end())
-				{
-					_fds[i].events = POLLIN;
-					continue;
-				}
+					bool keep_alive = (k_it != _fd_keep_alive.end() && k_it->second);
+					if (p_it == _pending_response.end())
+					{
+						if (!process_parsed_request(client_fd, servers))
+							_fds[i].events = POLLIN;
+						continue;
+					}
 				if (p_it->second.empty())
 				{
 					if (keep_alive)
 					{
-						_pending_response.erase(client_fd);
-						_fd_keep_alive.erase(client_fd);
-						_requests[client_fd].consume_parsed_request();
-						if(_requests[client_fd].IsParsed() == true)
-						{
-							int s_idx = resolve_server_index(client_fd, _requests[client_fd], servers);
-							LocationConfig* script_loc = NULL;
-							LocationConfig* cgi_loc = NULL;
-							std::string uri_path;
-							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], script_loc, cgi_loc, uri_path))
-							{
-								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
-								_requests[client_fd].clearBody();
-								continue;
-							}
-							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
-							_pending_response[client_fd] = _responses[client_fd].get_raw_response();
-							log_post_upload_success(client_fd, _requests[client_fd], _pending_response[client_fd]);
-							keep_alive = get_keep_alive(_requests[client_fd]);
-							_fd_keep_alive[client_fd] = keep_alive;
-							_fds[i].events = POLLIN | POLLOUT;
+							_pending_response.erase(client_fd);
+							_fd_keep_alive.erase(client_fd);
+							_requests[client_fd].consume_parsed_request();
+							if (!process_parsed_request(client_fd, servers))
+								_fds[i].events = POLLIN;
 						}
-						else
-							_fds[i].events = POLLIN;
-					}
 					else
 					{
 						close_connection(i);
@@ -2061,31 +2135,12 @@ void server::srv_manage(Config& servers)
 				{
 					if (keep_alive)
 					{
-						_pending_response.erase(client_fd);
-						_fd_keep_alive.erase(client_fd);
-						_requests[client_fd].consume_parsed_request();
-						if(_requests[client_fd].IsParsed() == true)
-						{
-							int s_idx = resolve_server_index(client_fd, _requests[client_fd], servers);
-							LocationConfig* script_loc = NULL;
-							LocationConfig* cgi_loc = NULL;
-							std::string uri_path;
-							if (is_cgi_request(_requests[client_fd], servers._servers[s_idx], script_loc, cgi_loc, uri_path))
-							{
-								start_cgi_job(client_fd, _requests[client_fd], servers._servers[s_idx], *script_loc, *cgi_loc, uri_path, s_idx);
-								_requests[client_fd].clearBody();
-								continue;
-							}
-							_responses[client_fd].build(_requests[client_fd], servers._servers[s_idx]);
-							_pending_response[client_fd] = _responses[client_fd].get_raw_response();
-							log_post_upload_success(client_fd, _requests[client_fd], _pending_response[client_fd]);
-							keep_alive = get_keep_alive(_requests[client_fd]);
-							_fd_keep_alive[client_fd] = keep_alive;
-							_fds[i].events = POLLIN | POLLOUT;
+							_pending_response.erase(client_fd);
+							_fd_keep_alive.erase(client_fd);
+							_requests[client_fd].consume_parsed_request();
+							if (!process_parsed_request(client_fd, servers))
+								_fds[i].events = POLLIN;
 						}
-						else
-							_fds[i].events = POLLIN;
-					}
 					else
 					{
 						close_connection(i);
@@ -2121,11 +2176,15 @@ void server::srv_manage(Config& servers)
 	_port_socket.clear();
 	_pending_response.clear();
 	_fd_keep_alive.clear();
-	_cgi_jobs.clear();
-	_cgi_in_to_client.clear();
-	_cgi_out_to_client.clear();
-	return;
-}
+		_cgi_jobs.clear();
+		_cgi_in_to_client.clear();
+		_cgi_out_to_client.clear();
+		_upload_in_progress.clear();
+		_upload_waiting.clear();
+		_upload_waiting_order.clear();
+		_active_upload_count = 0;
+		return;
+	}
 
 void AppManager::signal_handler(int s)
 {

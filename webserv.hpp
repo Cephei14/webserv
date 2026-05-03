@@ -21,8 +21,9 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <deque>
 
-#define BUFF_SIZE 524288
+#define BUFF_SIZE 65536
 #define TOUT 500
 
 class LocationConfig
@@ -94,12 +95,13 @@ class HTTPRequest
 {
 public:
 	HTTPRequest();
-	bool IsParsed();
+	bool IsParsed() const;
 	void AddRawP(const char* line, int nbytes);
 	void Validate(const std::string& line);
 	void consume_parsed_request();
 	void reset_parse_state();
 	void clearBody();
+	void takeBody(std::string& out);
 	const std::string& getMethod() const;
 	const std::string& getUri() const;
 	const std::map<std::string, std::string>& getMap() const;
@@ -121,11 +123,15 @@ private:
 class server
 {
 public:
+	server();
 	void start_listening(Config& servers);
 	void srv_manage(Config& servers);
 	void poll_setup(int newfd);
 	void close_connection(size_t& index);
 private:
+	bool can_read_upload_body(int client_fd, const HTTPRequest& req);
+	void release_upload_slot(int client_fd);
+	void resume_one_waiting_upload();
 	struct CgiJob
 	{
 		CgiJob()
@@ -148,8 +154,9 @@ private:
 	};
 
 	bool is_cgi_request(const HTTPRequest& req, ServerConfig& srv, LocationConfig*& script_loc, LocationConfig*& cgi_loc, std::string& uri_path);
-	bool start_cgi_job(int client_fd, const HTTPRequest& req, ServerConfig& srv, const LocationConfig& script_loc, const LocationConfig& cgi_loc, const std::string& uri_path, int server_index);
+	bool start_cgi_job(int client_fd, HTTPRequest& req, ServerConfig& srv, const LocationConfig& script_loc, const LocationConfig& cgi_loc, const std::string& uri_path, int server_index);
 	void process_cgi_pipe_event(size_t& i, Config& servers);
+	bool process_parsed_request(int client_fd, Config& servers);
 	void finalize_cgi_job(int client_fd, Config& servers, bool success, int status_code);
 	void cleanup_cgi_job(int client_fd, bool kill_child);
 	void set_client_events(int client_fd, short events);
@@ -167,6 +174,10 @@ private:
 	std::map<int, CgiJob> _cgi_jobs;
 	std::map<int, int> _cgi_in_to_client;
 	std::map<int, int> _cgi_out_to_client;
+	std::map<int, bool> _upload_in_progress;
+	std::map<int, bool> _upload_waiting;
+	std::deque<int> _upload_waiting_order;
+	size_t _active_upload_count;
 };
 
 class AppManager
