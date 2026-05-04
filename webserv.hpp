@@ -159,6 +159,7 @@ private:
 	bool process_parsed_request(int client_fd, Config& servers);
 	void finalize_cgi_job(int client_fd, Config& servers, bool success, int status_code);
 	void cleanup_cgi_job(int client_fd, bool kill_child);
+	void reap_deferred_children();
 	void set_client_events(int client_fd, short events);
 	bool get_keep_alive(const HTTPRequest& req) const;
 	int resolve_server_index(int client_fd, const HTTPRequest& req, const Config& servers) const;
@@ -177,6 +178,7 @@ private:
 	std::map<int, bool> _upload_in_progress;
 	std::map<int, bool> _upload_waiting;
 	std::deque<int> _upload_waiting_order;
+	std::vector<pid_t> _children_to_reap;
 	size_t _active_upload_count;
 };
 

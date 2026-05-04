@@ -4,7 +4,7 @@ static volatile sig_atomic_t signaled = 0;
 static const size_t MAX_REQUEST_LINE_BYTES = 8192;
 static const size_t MAX_URI_BYTES = 8192;
 static const size_t MAX_HEADER_BLOCK_BYTES = 65536;
-static const size_t MAX_CONCURRENT_UPLOADS = 3;
+static const size_t MAX_CONCURRENT_UPLOADS = 4;
 
 static long now_ms()
 {
@@ -14,10 +14,9 @@ static long now_ms()
 	return static_cast<long>(tv.tv_sec) * 1000L + static_cast<long>(tv.tv_usec / 1000L);
 }
 
-static bool reap_child_blocking(pid_t pid)
+static bool reap_child_nonblocking(pid_t pid)
 {
-	// After SIGKILL the child exits nearly immediately; one blocking wait is fine.
-	return (waitpid(pid, NULL, 0) == pid);
+	return (waitpid(pid, NULL, WNOHANG) == pid);
 }
 
 static std::string to_lower_copy(const std::string& s)
@@ -1524,7 +1523,8 @@ bool server::start_cgi_job(int client_fd, HTTPRequest& req, ServerConfig& srv, c
 		if (is_post)
 			close(in_fd[1]);
 		kill(pid, SIGKILL);
-		reap_child_blocking(pid);
+		if (!reap_child_nonblocking(pid))
+			_children_to_reap.push_back(pid);
 		HTTPResponse err;
 		err.build_error_response(500, srv);
 		_pending_response[client_fd] = err.get_raw_response();
@@ -1537,7 +1537,8 @@ bool server::start_cgi_job(int client_fd, HTTPRequest& req, ServerConfig& srv, c
 		close(out_fd[0]);
 		close(in_fd[1]);
 		kill(pid, SIGKILL);
-		reap_child_blocking(pid);
+		if (!reap_child_nonblocking(pid))
+			_children_to_reap.push_back(pid);
 		HTTPResponse err;
 		err.build_error_response(500, srv);
 		_pending_response[client_fd] = err.get_raw_response();
@@ -1598,7 +1599,9 @@ void server::cleanup_cgi_job(int client_fd, bool kill_child)
 	if (kill_child && job.pid > 0 && !job.child_done)
 	{
 		kill(job.pid, SIGKILL);
-		job.child_done = reap_child_blocking(job.pid);
+		job.child_done = reap_child_nonblocking(job.pid);
+		if (!job.child_done)
+			_children_to_reap.push_back(job.pid);
 	}
 
 	int fds_to_disable[2];
@@ -1625,6 +1628,18 @@ void server::cleanup_cgi_job(int client_fd, bool kill_child)
 	}
 	job.in_fd = -1;
 	job.out_fd = -1;
+}
+
+void server::reap_deferred_children()
+{
+	for (size_t i = 0; i < _children_to_reap.size();)
+	{
+		pid_t w = waitpid(_children_to_reap[i], NULL, WNOHANG);
+		if (w == _children_to_reap[i] || w == -1)
+			_children_to_reap.erase(_children_to_reap.begin() + i);
+		else
+			++i;
+	}
 }
 
 void server::finalize_cgi_job(int client_fd, Config& servers, bool success, int status_code)
@@ -1942,6 +1957,7 @@ void server::srv_manage(Config& servers)
 			break;
 		if (poll(&_fds[0], _fds.size(), TOUT) == -1)
 			continue;
+		reap_deferred_children();
 		std::vector<int> timed_out_clients;
 		long now = now_ms();
 		for (std::map<int, CgiJob>::iterator jt = _cgi_jobs.begin(); jt != _cgi_jobs.end(); ++jt)
@@ -2160,7 +2176,7 @@ void server::srv_manage(Config& servers)
 	for (std::map<int, CgiJob>::iterator it = _cgi_jobs.begin(); it != _cgi_jobs.end(); ++it)
 	{
 		kill(it->second.pid, SIGKILL);
-		reap_child_blocking(it->second.pid);
+		reap_child_nonblocking(it->second.pid);
 	}
 	for(size_t i = 0; i < _fds.size(); i++)
 	{
@@ -2177,9 +2193,10 @@ void server::srv_manage(Config& servers)
 	_pending_response.clear();
 	_fd_keep_alive.clear();
 		_cgi_jobs.clear();
-		_cgi_in_to_client.clear();
-		_cgi_out_to_client.clear();
-		_upload_in_progress.clear();
+	_cgi_in_to_client.clear();
+	_cgi_out_to_client.clear();
+	_children_to_reap.clear();
+	_upload_in_progress.clear();
 		_upload_waiting.clear();
 		_upload_waiting_order.clear();
 		_active_upload_count = 0;
