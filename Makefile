@@ -4,7 +4,15 @@ CXX = c++
 CXXFLAGS = -Wall -Wextra -Werror -std=c++98
 DEPFLAGS = -MMD -MP
 
-SRCS = webserv.cpp
+SRCS = webserv.cpp \
+       LocationConfig.cpp \
+       ServerConfig.cpp \
+       Config.cpp \
+       HTTPRequest.cpp \
+       HTTPResponse.cpp \
+       server.cpp \
+       AppManager.cpp \
+       WebservUtils.cpp
 OBJS = $(SRCS:.cpp=.o)
 DEPS = $(OBJS:.o=.d)
 
