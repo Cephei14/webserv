@@ -151,11 +151,12 @@ Answer: routes
 Each location can override root, index, allowed methods, CGI settings,
 autoindex, return redirects, and client body limit.
 
+===========================================================================================
 
-4. Basic tests with current webserv.conf
+4. Basic tests with current other.conf
 
 Start server:
-Run: ./webserv webserv.conf
+Run: ./webserv other.conf
 
 GET root:
 Run: curl -i http://127.0.0.1:8080/
@@ -334,12 +335,11 @@ Terminal 2 with another config using port 8080:
 Run: ./webserv other.conf
 Expect: second process cannot bind the already-used port. It should not crash.
 
+===========================================================================================
 
 7. Siege and stress tests
 
 Install siege if needed:
-Run: brew install siege
-or on Ubuntu:
 Run: sudo apt install siege
 
 Basic stress:
@@ -381,7 +381,27 @@ Both evaluator and evaluated students should understand scripts before using
 them. Do not rely only on scripts; also show manual curl/browser tests.
 
 
-9. Status code cheat sheet
+9. Final defense checklist
+
+Before evaluation:
+- make fclean && make passes
+- make again does not relink
+- ./webserv requires exactly one config argument
+- server starts and stops cleanly
+- curl GET / returns 200
+- bad request does not crash
+- unknown method does not crash
+- POST body limit returns 413 when too large
+- allowed methods return 405 when blocked
+- CGI route works if demonstrated
+- browser can load a static page
+- siege availability is above 99.5%
+- memory does not grow indefinitely
+- be ready to show poll loop and read/write handling in server.cpp
+
+===========================================================================================
+
+10. Status code sheet
 
 200 OK:
 Successful GET or CGI response.
@@ -424,23 +444,3 @@ Unknown HTTP method.
 
 505 HTTP Version Not Supported:
 HTTP version is not HTTP/1.1.
-
-
-10. Final defense checklist
-
-Before evaluation:
-- make fclean && make passes
-- make again does not relink
-- ./webserv requires exactly one config argument
-- server starts and stops cleanly
-- curl GET / returns 200
-- bad request does not crash
-- unknown method does not crash
-- POST body limit returns 413 when too large
-- allowed methods return 405 when blocked
-- CGI route works if demonstrated
-- browser can load a static page
-- siege availability is above 99.5%
-- memory does not grow indefinitely
-- be ready to show poll loop and read/write handling in server.cpp
-
