@@ -1,25 +1,20 @@
-Webserv defense preparation file
-Based on evaluation_webserv.txt
+===========================================================================================
+					SETUP & CODE CHECK & VERBAL EXPLANATIONS
+===========================================================================================
 
-Goal:
-Use this file to rehearse the oral answers and run the required tests during
-evaluation. Keep one terminal running the server and use another terminal for
-curl, nc, siege, grep, and browser checks.
-
-Recommended start:
 Run: make fclean && make
 Expect: compilation succeeds with no warnings/errors.
 
 Run: make
 Expect: no unnecessary relink.
 
-Run: ./webserv webserv.conf
+Run: ./webserv other.conf
 Expect: server starts and stays alive until Ctrl-C.
 
 
 1. Mandatory oral answers
 
-Question: Explain the basics of an HTTP server.
+Question: Basics of an HTTP server.
 Answer:
 An HTTP server listens on one or more sockets, accepts TCP clients, reads HTTP
 requests, parses the request line, headers, and optional body, maps the URI to
@@ -152,6 +147,8 @@ Each location can override root, index, allowed methods, CGI settings,
 autoindex, return redirects, and client body limit.
 
 ===========================================================================================
+								MANUAL TESTING
+===========================================================================================
 
 4. Basic tests with current other.conf
 
@@ -206,11 +203,11 @@ Run: curl -i -X POST --data-binary @/tmp/body_200.txt http://127.0.0.1:8080/post
 Expect: HTTP/1.1 413 because /post_body limit is 100 bytes.
 
 CGI POST route:
-Run: curl -i -X POST --data 'abcde' http://127.0.0.1:8080/YoupiBanane/youpi.bla
+curl -s -i -X POST --data "abcde" "http://127.0.0.1:8080/cgi-bin/test.py?Hello42"
 Expect: CGI response and no crash.
 
 Chunked POST to CGI:
-Run: printf 'POST /YoupiBanane/youpi.bla HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n' | nc 127.0.0.1 8080
+Run: printf 'POST /cgi-bin/test.py?Hello_Again HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n' | nc 127.0.0.1 8080
 Expect: CGI receives decoded body, not raw chunk markers.
 
 Keep-alive sanity:
@@ -242,30 +239,12 @@ Expect: configured default file is served.
 
 6. Temporary config tests for evaluation
 
-These require editing only the configuration file, which the scale allows.
-Make a backup first:
-Run: cp webserv.conf /tmp/webserv.conf.backup
-
 After each config change:
 1. Stop server with Ctrl-C.
 2. Run: ./webserv webserv.conf
 3. Run the matching curl/browser tests.
-4. Restore when done if needed:
-   Run: cp /tmp/webserv.conf.backup webserv.conf
 
 Multiple ports test:
-Add a second server block:
-
-server {
-    listen 8081;
-    host 0.0.0.0;
-    server_name second.local;
-    root ./www_test;
-    index test.html;
-    location / {
-        allow_methods GET;
-    }
-}
 
 Run: curl -i http://127.0.0.1:8080/
 Expect: first site.
@@ -280,10 +259,12 @@ Run: curl -i -H "Host: localhost" http://127.0.0.1:8080/
 Expect: localhost server content.
 
 Run: curl -i -H "Host: other" http://127.0.0.1:8080/
+(Or run: curl --resolve other:8080:127.0.0.1 -i http://other:8080/")
 Expect: other server content if configured.
 
-Alternative:
-Run: curl --resolve other:8080:127.0.0.1 -i http://other:8080/
+CGI POST route:
+Run: curl -i -X POST --data 'abcde' -H "Host: other" http://127.0.0.1:8080/YoupiBanane/youpi.bla 
+Expect: CGI response and no crash.
 
 Custom 404 error page test:
 Inside server block, add:
@@ -293,21 +274,11 @@ Run: curl -i http://127.0.0.1:8080/does-not-exist
 Expect: HTTP/1.1 404 and body from ./www/errors/404.html.
 
 Redirect test:
-Inside server block, add:
-location /old {
-    return 301 /;
-}
 
 Run: curl -i http://127.0.0.1:8080/old
 Expect: HTTP/1.1 301 and Location: /.
 
 Autoindex test:
-Inside server block, add:
-location /errors/ {
-    root ./www/errors;
-    allow_methods GET;
-    autoindex on;
-}
 
 Run: curl -i http://127.0.0.1:8080/errors/
 Expect: HTTP/1.1 200 and an HTML listing if no index file is selected.
@@ -335,6 +306,8 @@ Terminal 2 with another config using port 8080:
 Run: ./webserv other.conf
 Expect: second process cannot bind the already-used port. It should not crash.
 
+===========================================================================================
+							TESTING WITH PROGRAMS
 ===========================================================================================
 
 7. Siege and stress tests
@@ -400,8 +373,8 @@ Before evaluation:
 - be ready to show poll loop and read/write handling in server.cpp
 
 ===========================================================================================
-
-10. Status code sheet
+								STATUS CODES
+===========================================================================================
 
 200 OK:
 Successful GET or CGI response.
