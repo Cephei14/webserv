@@ -330,7 +330,14 @@ void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, con
 	    if (!idx.empty())
 	        full_path += idx[0];
 	}
-	if (std::remove(full_path.c_str()) == 0)
+	struct stat st;
+	if (stat(full_path.c_str(), &st) != 0)
+	{
+		_statusCode = 404;
+		_body = "<h1>404 Not Found: File does not exist</h1>";
+		_contentType = "text/html";
+	}
+	else if (std::remove(full_path.c_str()) == 0)
 	{
 		_statusCode = 204;
 		_body = "";
@@ -338,8 +345,8 @@ void HTTPResponse::prepare_DELETE(const HTTPRequest& req, ServerConfig& srv, con
 	}
 	else
 	{
-		_statusCode = 404;
-		_body = "<h1>404 Not Found: File does not exist</h1>";
+		_statusCode = 403;
+		_body = "<h1>403 Forbidden: Cannot delete file</h1>";
 		_contentType = "text/html";
 	}
 	construct_response(req);
