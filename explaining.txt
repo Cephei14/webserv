@@ -1,0 +1,400 @@
+1. The big picture
+------------------
+The server is built around one poll-driven event loop. At startup,
+it parses webserv.conf into server and location objects, opens listening sockets, and puts
+those listening sockets into the poll vector with POLLIN enabled. From that point on, the
+server does not create one thread per client. Instead, every listening socket, every
+connected client socket, and every CGI pipe is represented by a file descriptor in the same
+poll vector.
+
+When poll says a listening socket is readable, that means a new client is waiting. The
+server accepts the connection, marks the new client socket non-blocking, remembers which
+server block accepted it, and adds the client fd to poll with POLLIN enabled. A normal new
+client is therefore read-only at first: the server is waiting for request bytes.
+
+When poll says a client socket is readable, the server calls recv, appends those bytes to
+that client's HTTPRequest object, and asks the parser whether a complete request is ready.
+The parser supports incremental parsing: it can receive only part of the headers, return
+without marking the request complete, then continue when the next recv arrives. For POST,
+it waits until either the declared Content-Length bytes are present or the terminating
+chunked marker is present.
+
+Once the request is complete, process_parsed_request decides whether the request is CGI or
+normal HTTP. A normal request is turned into a raw HTTP response immediately and stored in
+_pending_response. A CGI request creates a CGI job instead of building the final response
+immediately.
+
+2. Do we monitor read and write at the same time for one client?
+---------------------------------------------------------------
+The server monitor read and write at the same time but only at specific moments.
+
+A newly accepted client is monitored for POLLIN only, because there is not yet anything to
+send. After the server has a response ready in _pending_response, it calls
+set_client_events(client_fd, POLLIN | POLLOUT). That means poll may wake up for either more
+client input or socket writability.
+
+The reason this matters is keep-alive and pipelining. With HTTP/1.1, a client can keep the
+same TCP connection open and may even send the next request before the previous response
+has fully been written. By keeping POLLIN enabled while POLLOUT is also enabled, the server
+can continue receiving data from the same client instead of ignoring incoming bytes until
+the old response is finished.
+
+There is an important detail in the event loop: the code checks POLLIN before POLLOUT for a
+client fd. So if a socket is both readable and writable in the same poll cycle, the server
+handles readable data first. If the response is pending, the response remains in
+_pending_response and will be sent when the POLLOUT path runs in a later iteration.
+
+When the response is fully sent, the server checks the keep-alive decision stored in
+_fd_keep_alive. If keep-alive is false, it closes the connection. If keep-alive is true, it
+removes the finished response, clears the keep-alive flag for that response, and calls
+consume_parsed_request on the HTTPRequest. That function resets the parsed request state
+but preserves any unread bytes that were already received after the previous request. Then
+the server immediately tries process_parsed_request again. This is how request pipelining
+works: if the next request is already complete in the buffer, it can create the next
+response right away; otherwise the fd goes back to POLLIN.
+
+3. How keep-alive is decided
+----------------------------
+The server treats HTTP/1.1 connections as keep-alive by default. It looks at the Connection
+header, lowercases the value, and if the value is exactly close, it marks the response as
+not keep-alive. The raw response builder then writes either Connection: keep-alive or
+Connection: close. The write path uses that stored decision after all response bytes are
+sent.
+
+4. How a normal static request flows
+------------------------------------
+For a static GET, the server finds the best location for the URI, checks allowed methods,
+handles redirects if configured, maps the URI to a filesystem path using the location root
+or server root, and then reads the file or builds an error response. The response is stored
+as one string in _pending_response.
+
+The POLLOUT path sends from that string with send. Because sockets are non-blocking, send
+might write only part of the response. In that case, the server erases the sent prefix and
+keeps the remaining bytes in _pending_response. poll will notify POLLOUT again later, and
+the next send continues where the previous one stopped.
+
+5. How POST upload limits fit into the loop
+-------------------------------------------
+For POST requests, the parser reads the body according to Content-Length or chunked
+encoding. The server also performs an early Content-Length check while the request is still
+being read. It chooses the effective body limit from the matched location when available,
+or the server-level client_max_body_size otherwise. For CGI, it uses the CGI location's
+limit when that location sets one and falls back to the server-level limit. If the declared
+length is too large, it builds a 413 response and switches the client to the write path
+without reading the full upload body.
+
+After a POST request is fully parsed, process_parsed_request performs another body-size
+check using the actual parsed body size. This matters for chunked requests, because the
+final decoded or raw body size is only known after parsing.
+
+6. How the server detects CGI requests
+--------------------------------------
+The CGI decision is based on the request method and file extension. Only GET and POST are
+eligible for CGI. The server first finds the best matching script location for the URI so
+it can map the requested script to the correct filesystem root. Then it scans configured
+locations looking for a location with a cgi_path and a matching cgi_extension. If the URI
+extension matches one of those configured CGI extensions, the request becomes a CGI job.
+
+This means there are two location concepts involved in CGI:
+
+- script_loc: the best URI location used to resolve the requested script path;
+- cgi_loc: the location that provides the interpreter or CGI executable and the CGI
+  extension list.
+
+In the sample config, /cgi-bin/ maps Python scripts under www/cgi-bin to /usr/bin/python3,
+while the 42 tester .bla flow maps .bla requests to the bundled cgi_tester executable.
+
+7. How the CGI script path is built
+-----------------------------------
+The server removes the query string from the URI before filesystem mapping. It selects the
+root from the script location if that location has one, otherwise from the server block. If
+the script location is not /, the matched location prefix is stripped from the URI before
+joining the remaining path to the root. Relative paths like ./www are converted to absolute
+paths using getcwd so execve and chdir work reliably.
+
+For example, with location /cgi-bin/ using root ./www/cgi-bin, the URI
+/cgi-bin/test.py?x=42 becomes the script path ./www/cgi-bin/test.py, then an absolute path
+inside the project directory.
+
+8. How the CGI environment is prepared
+--------------------------------------
+Before forking, the parent builds the CGI environment vector. It includes variables like:
+
+- REQUEST_METHOD from the HTTP method;
+- GATEWAY_INTERFACE=CGI/1.1;
+- SERVER_PROTOCOL from the request version;
+- QUERY_STRING from the part of the URI after ?;
+- REQUEST_URI from the original URI;
+- SCRIPT_NAME and PATH_INFO from the URI path;
+- SCRIPT_FILENAME from the resolved filesystem path;
+- CONTENT_LENGTH and CONTENT_TYPE for POST bodies;
+- HTTP_* variables converted from other request headers.
+
+This is why running a CGI executable directly from the shell can print something like
+"cgi: no REQUEST_METHOD in environment". A CGI program expects the web server to provide
+REQUEST_METHOD and the rest of the CGI environment before execve.
+
+9. What happens during fork for CGI
+-----------------------------------
+For CGI, the server creates an output pipe before forking. For POST, it also creates an
+input pipe. The child process is responsible for executing the CGI program, while the
+parent process keeps running the poll loop.
+
+In the child:
+
+- for POST, stdin is dup2'd from the read end of the input pipe;
+- for GET, stdin is replaced with /dev/null;
+- stdout is dup2'd to the write end of the output pipe;
+- the child computes the script directory and calls chdir to that directory;
+- finally it calls execve with args[0] as the CGI executable/interpreter and args[1] as
+  the script path.
+
+The chdir call happens only in the child process after fork. That is important: changing
+the CGI process directory does not change the working directory of the main web server.
+The purpose is to satisfy the CGI requirement that scripts run in the correct directory,
+so relative file access inside the script behaves naturally.
+
+10. How CGI is integrated into poll
+-----------------------------------
+The parent does not block waiting for the CGI process. After fork, it closes the pipe ends
+that belong to the child and marks the parent pipe fds non-blocking.
+
+For POST CGI, the parent adds the CGI input pipe to poll with POLLOUT so it can write the
+request body into the CGI program when the pipe has capacity. It also adds the CGI output
+pipe to poll with POLLIN so it can read CGI output when the child produces data.
+
+For GET CGI, there is no request body to write, so only the CGI output pipe is polled for
+POLLIN.
+
+While a CGI job is active, the client socket itself is set to events 0. In other words, the
+server temporarily stops reading or writing that client fd directly while it is feeding and
+collecting the CGI. The poll loop is still alive for all other clients and listening
+sockets, so one slow CGI does not block the whole server.
+
+11. How CGI output becomes an HTTP response
+-------------------------------------------
+The parent accumulates bytes from the CGI output pipe in the CgiJob object. When the CGI
+output pipe reaches EOF and the child exits, finalize_cgi_job parses the CGI output header
+block. It recognizes a Status header and Content-Type header, separates CGI headers from
+the body, and then builds a normal HTTP/1.1 response string.
+
+At that point the response is put into _pending_response for the original client, the
+keep-alive decision is stored, and the client fd is re-enabled with POLLIN | POLLOUT. From
+there, sending the CGI response is the same as sending any other response: the POLLOUT path
+sends the pending response string until it is empty.
+
+12. Why the server can handle multiple things at once without threads
+---------------------------------------------------------------------
+The key idea is that every blocking operation is avoided or moved into poll-managed file
+descriptors:
+
+- listening sockets are watched for new connections;
+- client sockets are watched for readable request bytes and writable response capacity;
+- CGI input pipes are watched for writable capacity;
+- CGI output pipes are watched for readable output;
+- CGI children are checked with non-blocking waitpid and timeouts.
+
+Because the main loop keeps returning to poll, the server can accept a new client, read
+part of one request, write part of another response, feed a POST body to a CGI process,
+and read output from a different CGI process across separate poll iterations without
+blocking the entire program on one operation.
+
+13. A concise reviewer answer
+-----------------------------
+If I had to summarize it out loud, I would say:
+
+"This webserv is single-threaded and event-driven. It stores all listening sockets, client
+sockets, and CGI pipes in one poll vector. New clients start as POLLIN only. Once a normal
+response is ready, the client can be monitored for both POLLIN and POLLOUT so keep-alive
+and pipelined requests are not ignored while the previous response is being written. For
+CGI, the client fd is temporarily disabled, the child process gets stdin/stdout connected
+to pipes, and the parent polls those pipes instead. The child chdirs to the script's
+directory before execve, so relative paths work for the script without changing the main
+server's directory. When the CGI finishes, its output is converted into a normal HTTP
+response and sent through the same pending-response write path as static files."
+
+14. Questions a reviewer may ask, with response-style answers
+-------------------------------------------------------------
+
+Q: A normal request goes to _pending_response and a CGI request goes to _cgi_jobs. Does the
+CGI job also go to _pending_response?
+
+A: Not immediately. A normal request can be converted directly into an HTTP response, so it
+is stored in _pending_response right away. A CGI request is different because the server
+must first fork the CGI process, optionally send the request body to the child through a
+pipe, read the child's output from another pipe, and wait for the CGI output to finish.
+During that time the request lives in _cgi_jobs, not _pending_response. When the CGI job is
+finished, finalize_cgi_job parses the CGI output, builds a normal HTTP response string,
+stores that string in _pending_response for the original client fd, and then the normal
+POLLOUT response-sending code sends it. So the short answer is: CGI goes to _cgi_jobs
+first, then later becomes _pending_response after the CGI output is complete.
+
+Q: Why not put the CGI response into _pending_response immediately?
+
+A: Because at the moment the CGI starts, the server does not have the response yet. The
+response is produced by the external CGI process. Until the child writes its output and the
+parent reads it, there is no complete HTTP body or CGI header block to convert into a final
+HTTP response.
+
+Q: While a CGI job is running, is the client socket still monitored for read and write?
+
+A: No. For an active CGI job, the client fd is temporarily set to events 0. The server is
+not directly reading from or writing to that client while it is waiting for the CGI result.
+Instead, the poll loop monitors the CGI pipes. Once the CGI is finalized and the final HTTP
+response is stored in _pending_response, the client fd is re-enabled with POLLIN | POLLOUT.
+
+Q: Does this mean one CGI blocks the whole server?
+
+A: No. The client waiting for that CGI is paused, but the whole server is not paused. The
+main process keeps polling all other fds: other clients, listening sockets, and other CGI
+pipes. The CGI child runs separately, and the parent uses non-blocking pipes and poll.
+
+Q: Why does the server use pipes for CGI?
+
+A: Pipes connect the server and the CGI process without blocking the main server. For POST,
+the parent writes the request body into the CGI child's stdin through an input pipe. For
+both GET and POST, the child writes its CGI output to stdout, which is connected to an
+output pipe that the parent reads.
+
+Q: For CGI GET, what happens to stdin?
+
+A: For GET, there is no request body, so the child process has stdin connected to
+/dev/null. The CGI still receives request information through environment variables like
+REQUEST_METHOD and QUERY_STRING.
+
+Q: For CGI POST, how does the body reach the script?
+
+A: The parent creates an input pipe before fork. In the child, the read end of that pipe is
+dup2'd onto STDIN_FILENO. In the parent, the write end is added to poll with POLLOUT. The
+parent writes the request body into that pipe when poll says the pipe can accept data.
+
+Q: Why does the child call chdir before execve?
+
+A: CGI scripts are expected to run in the correct directory so relative file access works.
+Only the child calls chdir after fork, so the main server process keeps its original
+working directory. After chdir, the child calls execve to replace itself with the CGI
+program or interpreter.
+
+Q: If execve replaces the child process, why prepare pipes and environment first?
+
+A: execve keeps the file descriptor table unless descriptors are explicitly closed or marked
+close-on-exec, and it receives the argv and envp arrays passed by the server. That means
+the child can set stdin/stdout with dup2, prepare the CGI environment, and then execve. The
+new program starts with stdin/stdout already connected to the pipes and with CGI variables
+available in its environment.
+
+Q: Why does running ./cgi_tester directly print "cgi: no REQUEST_METHOD in environment"?
+
+A: Because cgi_tester is a CGI program, not an HTTP client. It expects the web server to
+start it with CGI environment variables like REQUEST_METHOD. If it is launched directly
+from a shell, those variables do not exist, so it reports that REQUEST_METHOD is missing.
+
+Q: How does the server decide whether a request is CGI?
+
+A: It checks that the method is GET or POST, removes the query string from the URI, finds
+the extension of the requested path, and compares that extension with the configured
+cgi_extension values. It also finds the best script location for filesystem path mapping
+and the CGI location that provides cgi_path.
+
+Q: What is the difference between script_loc and cgi_loc?
+
+A: script_loc is the best matching location for the URI and is used to resolve the script's
+filesystem path. cgi_loc is the location that contains the CGI settings, mainly cgi_path
+and cgi_extension. In simple configs they may be the same location, but the code keeps them
+separate because path resolution and CGI executable selection are different jobs.
+
+Q: What is in the CGI environment?
+
+A: The server sets REQUEST_METHOD, GATEWAY_INTERFACE, SERVER_PROTOCOL, QUERY_STRING,
+REQUEST_URI, SCRIPT_NAME, PATH_INFO, SCRIPT_FILENAME, CONTENT_LENGTH, CONTENT_TYPE, and
+HTTP_* variables converted from request headers. The CGI script uses these to understand
+the original HTTP request.
+
+Q: How does the server parse CGI output?
+
+A: The parent reads the raw CGI output into the CgiJob. When the output is complete,
+finalize_cgi_job separates the CGI header block from the body. It handles headers such as
+Status and Content-Type, then builds a normal HTTP/1.1 response with a status line,
+headers, Content-Length, Connection, and the body.
+
+Q: What if the CGI output has no Content-Length?
+
+A: The server reads the CGI output until EOF on the CGI output pipe. That matches the CGI
+idea that EOF can mark the end of the returned data when no content length is provided.
+After EOF, the server knows the complete body size and can generate an HTTP Content-Length
+for the client response.
+
+Q: How does keep-alive work after a CGI response?
+
+A: The keep-alive decision is based on the original HTTP request, just like for static
+responses. When the CGI finishes, the final HTTP response is stored in _pending_response
+and the keep-alive flag is stored in _fd_keep_alive. The normal POLLOUT path sends the
+response and either closes the socket or prepares it for the next request.
+
+Q: Does the server support pipelining?
+
+A: The design supports pipelined data by preserving bytes that remain after the current
+parsed request. After a keep-alive response is sent, consume_parsed_request resets the
+request state while keeping any already received bytes, then process_parsed_request is
+called again. If the next request was already received and parsed, the next response can be
+created immediately.
+
+Q: Why does the server sometimes monitor POLLIN and POLLOUT on the same client?
+
+A: That happens when a response is ready but the connection is still allowed to receive
+more data. POLLOUT lets the server send the pending response, while POLLIN lets it keep
+reading additional client data for keep-alive or pipelined requests. This avoids ignoring
+incoming bytes just because the previous response has not fully drained yet.
+
+Q: If both POLLIN and POLLOUT are ready on a client, which one is handled first?
+
+A: In this event loop, the POLLIN branch is checked before the POLLOUT branch for client
+sockets. So if both are set in the same poll result, the server reads first, then sends in
+a later loop iteration.
+
+Q: How are partial sends handled?
+
+A: The response is stored as a string in _pending_response. send may write only part of it.
+When that happens, the server erases the bytes already sent and keeps the remaining suffix.
+The next POLLOUT event continues sending from the remaining data.
+
+Q: How are upload size limits applied?
+
+A: During request reading, the server can reject a POST early if Content-Length is larger
+than the effective limit. For non-CGI, the effective limit is the matched location's
+client_max_body_size if set, otherwise the server limit. For CGI, the effective limit is
+the CGI location's limit if set, otherwise the server limit. After parsing, the server also
+checks the actual body size before processing the request.
+
+Q: Why check upload size twice?
+
+A: The early Content-Length check avoids reading a huge body that is already known to be
+too large. The later parsed-body check is still needed because chunked requests do not rely
+on Content-Length in the same way, and because the server should validate the actual body
+it ended up receiving.
+
+Q: Why use non-blocking I/O?
+
+A: Non-blocking I/O prevents one slow socket or pipe from freezing the entire server. If a
+send, recv, or pipe operation cannot complete immediately, the server can return to poll
+and handle other ready fds.
+
+Q: What happens when the client disconnects?
+
+A: If recv returns 0, the server treats it as a hang-up and closes the connection. Cleanup
+removes the fd from poll, erases request and response state, releases upload tracking, and
+kills or cleans up any CGI job associated with that client if needed.
+
+Q: What happens if a CGI takes too long?
+
+A: The server tracks CGI job start and activity times. The main loop periodically checks
+CGI jobs for timeout conditions and finalizes failed or timed-out jobs with an error
+response, cleaning up pipes and child process state.
+
+Q: What is the simplest way to explain the request lifecycle?
+
+A: Accept creates a client fd monitored for POLLIN; recv fills an HTTPRequest;
+when parsing finishes, a static request becomes _pending_response immediately, while a CGI
+request becomes _cgi_jobs; once CGI output is complete, the CGI job is converted into
+_pending_response; POLLOUT sends _pending_response; after the response, keep-alive either
+closes the socket or resets the request object for the next request.

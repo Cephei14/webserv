@@ -1,0 +1,446 @@
+Webserv defense preparation file
+Based on evaluation_webserv.txt
+
+Goal:
+Use this file to rehearse the oral answers and run the required tests during
+evaluation. Keep one terminal running the server and use another terminal for
+curl, nc, siege, grep, and browser checks.
+
+Recommended start:
+Run: make fclean && make
+Expect: compilation succeeds with no warnings/errors.
+
+Run: make
+Expect: no unnecessary relink.
+
+Run: ./webserv webserv.conf
+Expect: server starts and stays alive until Ctrl-C.
+
+
+1. Mandatory oral answers
+
+Question: Explain the basics of an HTTP server.
+Answer:
+An HTTP server listens on one or more sockets, accepts TCP clients, reads HTTP
+requests, parses the request line, headers, and optional body, maps the URI to
+a configured route, builds an HTTP response with a status line, headers, and
+body, then sends it back to the client. For HTTP/1.1 it also handles keep-alive
+unless the connection must close.
+
+Question: Which function is used for I/O multiplexing?
+Answer:
+This project uses poll().
+
+Show:
+Run: grep -n "poll(" server.cpp
+Expect: poll appears in the main server loop.
+
+Question: How does poll work?
+Answer:
+poll receives an array of pollfd structures. Each entry contains a file
+descriptor and the events we want to watch, such as POLLIN for readable data
+or POLLOUT for writable output. poll blocks until at least one descriptor is
+ready or until the timeout expires. After it returns, the program checks
+revents and performs at most the I/O operation that is ready.
+
+Question: Do you use only one poll, and how do you manage accept/read/write?
+Answer:
+Yes. The main loop calls poll once over all listening sockets, client sockets,
+and CGI pipe descriptors. Listening sockets with POLLIN are accepted. Client
+sockets with POLLIN are read with recv. Client sockets with POLLOUT are written
+with send. CGI pipes are also handled through the same poll loop.
+
+Show:
+Run: grep -n "accept\\|recv\\|send\\|read\\|write\\|pipe\\|poll" server.cpp
+Expect: socket/pipe I/O is handled from the poll-driven server code.
+
+Question: Why only one read or write per client per poll?
+Answer:
+Because after poll reports readiness, the server performs one recv or one send
+for that ready descriptor, then returns to the loop. This avoids blocking one
+client while serving another and keeps the event loop responsive.
+
+Question: Are read/recv/write/send return values checked?
+Answer:
+Yes. recv checks negative return for error and zero for closed connection.
+send checks positive bytes sent, negative error, and keeps unsent data pending.
+CGI pipe read/write also check return values and clean up or finalize on error.
+
+Important evaluation warning:
+Do not check errno after read/recv/write/send as the main behavior. The scale
+says this is forbidden. The return value must drive the logic.
+
+Question: Does the server read/write file descriptors outside poll?
+Answer:
+Network sockets and CGI pipes are managed through poll. Normal file reads and
+writes for static files/uploads are not sockets and are allowed.
+
+Question: What happens on bad request/unknown method?
+Answer:
+The parser throws or marks an error response. Unknown methods return 501 Not
+Implemented. Bad syntax returns 400. The server must not crash.
+
+Question: What happens on SIGINT/SIGTERM/SIGPIPE?
+Answer:
+SIGINT and SIGTERM set a global signal flag so the server exits its loop and
+closes descriptors. SIGPIPE is ignored so a broken client connection does not
+kill the server process.
+
+Show:
+Run: grep -n "signal\\|SIGPIPE\\|SIGINT\\|SIGTERM" AppManager.cpp WebservUtils.cpp
+
+
+2. Code inspection commands
+
+Run: grep -n "poll(" server.cpp
+Expect: one main poll loop.
+
+Run: grep -n "accept(" server.cpp
+Expect: accept is used for listening sockets.
+
+Run: grep -n "recv(" server.cpp
+Expect: recv is used for client reads.
+
+Run: grep -n "send(" server.cpp
+Expect: send is used for client writes.
+
+Run: grep -n "read(" server.cpp
+Expect: read is used for CGI pipe output.
+
+Run: grep -n "write(" server.cpp
+Expect: write is used for CGI pipe input.
+
+Run: grep -n "fork(" server.cpp
+Expect: fork is used only for CGI.
+
+Run: grep -n "execve(" server.cpp
+Expect: execve is used only for CGI.
+
+Run: grep -n "errno" *.cpp *.hpp
+Expect: no I/O behavior depends on errno checks after read/recv/write/send.
+
+
+3. Configuration features to explain
+
+Current webserv.conf includes:
+- one server on port 8080
+- host 0.0.0.0
+- server_name localhost
+- root ./www
+- index index.html
+- client_max_body_size 1M on the server
+- GET-only route /
+- GET-only route /directory/ mapped to ./YoupiBanane
+- POST-only route /post_body with client_max_body_size 100
+- CGI POST route /YoupiBanane/ for .bla using ./cgi_tester
+
+Answer: multiple ports
+The parser supports multiple server blocks. Each block can listen on a port.
+The server opens one listening socket per unique port and maps clients back to
+the selected server configuration.
+
+Answer: multiple hostnames
+When more than one server uses the same port, the Host header is used to select
+the matching server_name. Test with curl --resolve or with a Host header.
+
+Answer: custom error pages
+The config supports error_page. If a matching custom page exists, it is loaded.
+Otherwise the server builds a default HTML error page.
+
+Answer: routes
+Each location can override root, index, allowed methods, CGI settings,
+autoindex, return redirects, and client body limit.
+
+
+4. Basic tests with current webserv.conf
+
+Start server:
+Run: ./webserv webserv.conf
+
+GET root:
+Run: curl -i http://127.0.0.1:8080/
+Expect: HTTP/1.1 200 and HTML from ./www/index.html.
+
+GET default file from /directory/:
+Run: curl -i http://127.0.0.1:8080/directory/
+Expect: HTTP/1.1 200 and content from YoupiBanane/youpi.bad_extension.
+
+GET missing file:
+Run: curl -i http://127.0.0.1:8080/not_here
+Expect: HTTP/1.1 404.
+
+UNKNOWN method:
+Run: printf 'BANANA / HTTP/1.1\r\nHost: localhost\r\n\r\n' | nc 127.0.0.1 8080
+Expect: HTTP/1.1 501 and no crash.
+
+Bad HTTP version:
+Run: printf 'GET / HTTP/1.0\r\nHost: localhost\r\n\r\n' | nc 127.0.0.1 8080
+Expect: HTTP/1.1 505 or an error response, no crash.
+
+Missing Host header:
+Run: printf 'GET / HTTP/1.1\r\n\r\n' | nc 127.0.0.1 8080
+Expect: HTTP/1.1 400 and no crash.
+
+Method not allowed on GET-only route:
+Run: curl -i -X DELETE http://127.0.0.1:8080/
+Expect: HTTP/1.1 405.
+
+POST to allowed upload-like route:
+Run: curl -i -X POST --data 'hello42' http://127.0.0.1:8080/post_body/test_upload.txt
+Expect: HTTP/1.1 201 if the destination can be written.
+
+GET uploaded file:
+Run: curl -i http://127.0.0.1:8080/post_body/test_upload.txt
+Expect: 405 because /post_body only allows POST in current config.
+Defense note: to retrieve uploads with GET, configure a route that allows both
+GET and POST or upload into a GET-accessible directory.
+
+Client body limit accepted:
+Run: curl -i -X POST --data 'short body' http://127.0.0.1:8080/post_body/small.txt
+Expect: HTTP/1.1 201.
+
+Client body limit rejected:
+Run: perl -e 'print "A" x 200' > /tmp/body_200.txt
+Run: curl -i -X POST --data-binary @/tmp/body_200.txt http://127.0.0.1:8080/post_body/big.txt
+Expect: HTTP/1.1 413 because /post_body limit is 100 bytes.
+
+CGI POST route:
+Run: curl -i -X POST --data 'abcde' http://127.0.0.1:8080/YoupiBanane/youpi.bla
+Expect: CGI response and no crash.
+
+Chunked POST to CGI:
+Run: printf 'POST /YoupiBanane/youpi.bla HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n' | nc 127.0.0.1 8080
+Expect: CGI receives decoded body, not raw chunk markers.
+
+Keep-alive sanity:
+Run: curl -i http://127.0.0.1:8080/ http://127.0.0.1:8080/not_here
+Expect: both responses are returned, server keeps running.
+
+
+5. Browser tests
+
+Open:
+http://127.0.0.1:8080/
+
+In browser devtools Network tab, check:
+- request line and request headers
+- response status
+- Content-Type
+- Content-Length
+- Connection
+- static page renders correctly
+
+Wrong URL:
+Open: http://127.0.0.1:8080/not_here
+Expect: 404 page.
+
+Directory/default index:
+Open: http://127.0.0.1:8080/directory/
+Expect: configured default file is served.
+
+
+6. Temporary config tests for evaluation
+
+These require editing only the configuration file, which the scale allows.
+Make a backup first:
+Run: cp webserv.conf /tmp/webserv.conf.backup
+
+After each config change:
+1. Stop server with Ctrl-C.
+2. Run: ./webserv webserv.conf
+3. Run the matching curl/browser tests.
+4. Restore when done if needed:
+   Run: cp /tmp/webserv.conf.backup webserv.conf
+
+Multiple ports test:
+Add a second server block:
+
+server {
+    listen 8081;
+    host 0.0.0.0;
+    server_name second.local;
+    root ./www_test;
+    index test.html;
+    location / {
+        allow_methods GET;
+    }
+}
+
+Run: curl -i http://127.0.0.1:8080/
+Expect: first site.
+
+Run: curl -i http://127.0.0.1:8081/
+Expect: second site from ./www_test/test.html.
+
+Multiple hostname test on same port:
+Use two server blocks with listen 8080 and different server_name/root values.
+
+Run: curl -i -H "Host: localhost" http://127.0.0.1:8080/
+Expect: localhost server content.
+
+Run: curl -i -H "Host: other" http://127.0.0.1:8080/
+Expect: other server content if configured.
+
+Alternative:
+Run: curl --resolve other:8080:127.0.0.1 -i http://other:8080/
+
+Custom 404 error page test:
+Inside server block, add:
+error_page 404 /errors/404.html;
+
+Run: curl -i http://127.0.0.1:8080/does-not-exist
+Expect: HTTP/1.1 404 and body from ./www/errors/404.html.
+
+Redirect test:
+Inside server block, add:
+location /old {
+    return 301 /;
+}
+
+Run: curl -i http://127.0.0.1:8080/old
+Expect: HTTP/1.1 301 and Location: /.
+
+Autoindex test:
+Inside server block, add:
+location /errors/ {
+    root ./www/errors;
+    allow_methods GET;
+    autoindex on;
+}
+
+Run: curl -i http://127.0.0.1:8080/errors/
+Expect: HTTP/1.1 200 and an HTML listing if no index file is selected.
+
+Allowed methods test:
+Change or add a route with:
+allow_methods GET POST DELETE;
+
+Run: curl -i -X DELETE http://127.0.0.1:8080/path/file.txt
+Expect: 204 if file exists, 404 if it does not. Not 405.
+
+Same port repeated test:
+Use two server blocks with the same listen port.
+Expected by evaluation wording: duplicate same-port configuration should not
+open duplicate sockets. If the project supports virtual hosts on the same port,
+explain that one socket is reused and Host selects the server. If a truly
+conflicting bind happens in another running process, the second process should
+fail to bind and report an error.
+
+Common port across two running webserv processes:
+Terminal 1:
+Run: ./webserv webserv.conf
+
+Terminal 2 with another config using port 8080:
+Run: ./webserv other.conf
+Expect: second process cannot bind the already-used port. It should not crash.
+
+
+7. Siege and stress tests
+
+Install siege if needed:
+Run: brew install siege
+or on Ubuntu:
+Run: sudo apt install siege
+
+Basic stress:
+Run: siege -b -t30S http://127.0.0.1:8080/
+Expect: availability above 99.5%.
+
+Longer stress:
+Run: siege -b -t2M http://127.0.0.1:8080/
+Expect: server keeps responding, no hanging connections.
+
+After siege:
+Run: curl -i http://127.0.0.1:8080/
+Expect: still HTTP/1.1 200.
+
+Memory monitoring:
+Run in another terminal while siege runs:
+ps -o pid,rss,command -C webserv
+Expect: RSS does not grow indefinitely.
+
+Valgrind, if available:
+Run: valgrind --leak-check=full --show-leak-kinds=all ./webserv webserv.conf
+Then run a few curl tests and stop with Ctrl-C.
+Expect: no definitely lost leaks from project code.
+
+
+8. Automated testers
+
+If using provided tester scripts, inspect them before running:
+Run: file tester cgi_tester
+Run: ./tester http://127.0.0.1:8080
+Run: ./cgi_tester http://127.0.0.1:8080
+
+If a script needs Python dependencies, use the virtualenv:
+Run: source .venv/bin/activate
+Run: python -m pip show requests
+
+Evaluation note:
+Both evaluator and evaluated students should understand scripts before using
+them. Do not rely only on scripts; also show manual curl/browser tests.
+
+
+9. Status code cheat sheet
+
+200 OK:
+Successful GET or CGI response.
+
+201 Created:
+Successful upload/write through POST.
+
+204 No Content:
+Successful DELETE.
+
+301 Moved Permanently:
+Configured redirect.
+
+400 Bad Request:
+Malformed request, invalid headers, missing Host.
+
+403 Forbidden:
+Invalid path, access denied, cannot write.
+
+404 Not Found:
+Requested file/route target does not exist.
+
+405 Method Not Allowed:
+Route exists but method is not allowed in allow_methods.
+
+411 Length Required:
+POST without Content-Length or Transfer-Encoding.
+
+413 Payload Too Large:
+Request body exceeds configured client_max_body_size.
+
+414 URI Too Long:
+Request line or URI exceeds parser limit.
+
+500 Internal Server Error:
+Unexpected server/CGI setup failure.
+
+501 Not Implemented:
+Unknown HTTP method.
+
+505 HTTP Version Not Supported:
+HTTP version is not HTTP/1.1.
+
+
+10. Final defense checklist
+
+Before evaluation:
+- make fclean && make passes
+- make again does not relink
+- ./webserv requires exactly one config argument
+- server starts and stops cleanly
+- curl GET / returns 200
+- bad request does not crash
+- unknown method does not crash
+- POST body limit returns 413 when too large
+- allowed methods return 405 when blocked
+- CGI route works if demonstrated
+- browser can load a static page
+- siege availability is above 99.5%
+- memory does not grow indefinitely
+- be ready to show poll loop and read/write handling in server.cpp
+
