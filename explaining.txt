@@ -1,3 +1,11 @@
+“GET is used to retrieve static files, directory indexes, autoindex pages, or execute CGI if the path matches a CGI extension.”
+
+“HEAD is implemented like GET, but when the final HTTP response is generated, the body is omitted.”
+
+“POST is the only method where the parser waits for a body. For normal routes it writes/uploads data, and for CGI it sends the body to the CGI process through stdin.”
+
+“DELETE is supported by the response layer and is used to remove files, but it only works when the matched location allows DELETE.”
+
 1. The big picture
 ------------------
 The server is built around one poll-driven event loop. At startup,
@@ -24,7 +32,7 @@ normal HTTP. A normal request is turned into a raw HTTP response immediately and
 _pending_response. A CGI request creates a CGI job instead of building the final response
 immediately.
 
-2. Do we monitor read and write at the same time for one client?
+2. How the server monitors read and write?
 ---------------------------------------------------------------
 The server monitor read and write at the same time but only at specific moments.
 
@@ -73,6 +81,8 @@ might write only part of the response. In that case, the server erases the sent 
 keeps the remaining bytes in _pending_response. poll will notify POLLOUT again later, and
 the next send continues where the previous one stopped.
 
+“We find the best location with longest-prefix matching. First we remove the query string from the URI. Then for every configured location, we normalize a trailing slash and check whether the URI path starts with that location prefix. We also make sure /post_body does not accidentally match /post_body_extra. For every valid match we keep the one with the largest prefix length. If nothing matches, we fall back to /. After that, we use the selected location’s root, strip the location prefix from the URI, and join the remaining path to the root to get the filesystem path.”
+
 5. How POST upload limits fit into the loop
 -------------------------------------------
 For POST requests, the parser reads the body according to Content-Length or chunked
@@ -86,6 +96,9 @@ without reading the full upload body.
 After a POST request is fully parsed, process_parsed_request performs another body-size
 check using the actual parsed body size. This matters for chunked requests, because the
 final decoded or raw body size is only known after parsing.
+
+“For chunked POST, the parser does not know the final body size from headers. It waits until it sees the terminating 0\r\n\r\n. At that point the raw chunked body is complete. Before handling the request, we decode the chunks and count the decoded body size. That decoded size is what we compare against client_max_body_size. For normal POST upload, we write the decoded body to the file. For CGI, we send the decoded body to the CGI stdin and set CONTENT_LENGTH to the decoded size. The only limitation is that we do not enforce the limit progressively chunk-by-chunk; for chunked requests, the limit is enforced after the full chunked body has been received.”
+
 
 6. How the server detects CGI requests
 --------------------------------------
