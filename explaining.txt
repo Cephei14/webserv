@@ -41,6 +41,8 @@ send. After the server has a response ready in _pending_response, it calls
 set_client_events(client_fd, POLLIN | POLLOUT). That means poll may wake up for either more
 client input or socket writability.
 
+"Using POLLOUT at the start a waste of CPU cycles. Most sockets are almost always "writable" (unless the kernel send buffer is full). If you enable POLLOUT immediately, poll() will constantly return instantly saying the socket is ready to write, even though you have nothing to send. This leads to a "busy-wait" loop that spikes CPU usage."
+
 The reason this matters is keep-alive and pipelining. With HTTP/1.1, a client can keep the
 same TCP connection open and may even send the next request before the previous response
 has fully been written. By keeping POLLIN enabled while POLLOUT is also enabled, the server
